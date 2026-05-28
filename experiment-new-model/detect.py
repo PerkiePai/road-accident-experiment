@@ -1,8 +1,6 @@
 import os
 import colorsys
 from collections import deque, defaultdict
-from pathlib import Path
-
 import cv2
 import numpy as np
 import torch
@@ -12,8 +10,8 @@ from ultralytics import RTDETR
 from boxmot.trackers.deepocsort.deepocsort import DeepOcSort
 
 # ─── Config ────────────────────────────────────────────────────
-INPUT_VIDEO  = "../_in/accident_cm_in_p10.mp4"
-OUTPUT_VIDEO = "out/accident_cm_in_p10_exp.mp4"
+INPUT_VIDEO  = "../_in/car_100kmh.mp4"
+OUTPUT_VIDEO = "out/car_100kmh_exp.mp4"
 H_PATH       = "H_manual.npy"
 SRC_PATH     = "src_manual.npy"
 TRACK_PATH   = "track_manual.npy"
@@ -138,46 +136,11 @@ def draw_road_overlay(frame, poly):
     cv2.addWeighted(ov, 0.18, frame, 0.82, 0, frame)
     cv2.polylines(frame, [poly], True, (255, 220, 0), 2)
 
-def draw_perspective_grid(frame, H, x_step=7.0, z_step=10.0, alpha=0.4):
-    H_inv   = np.linalg.inv(H)
-    fh, fw  = frame.shape[:2]
-    overlay = frame.copy()
-    rect    = (0, 0, fw - 1, fh - 1)
-    color   = (0, 255, 255)
 
-    corners = np.array(
-        [[[0., 0.]], [[fw-1., 0.]], [[fw-1., fh-1.]], [[0., fh-1.]]],
-        dtype=np.float32)
-    wc    = cv2.perspectiveTransform(corners, H)[:, 0, :]
-    x_min = float(wc[:, 0].min()) - x_step
-    x_max = float(wc[:, 0].max()) + x_step
-    z_min = float(wc[:, 1].min()) - z_step
-    z_max = float(wc[:, 1].max()) + z_step
-
-    def to_img(xm, zm):
-        p = cv2.perspectiveTransform(
-            np.array([[[xm, zm]]], dtype=np.float32), H_inv)[0, 0]
-        return (int(np.clip(round(p[0]), -32767, 32767)),
-                int(np.clip(round(p[1]), -32767, 32767)))
-
-    def draw_line(x0, z0, x1, z1):
-        ok, p0, p1 = cv2.clipLine(rect, to_img(x0, z0), to_img(x1, z1))
-        if ok:
-            cv2.line(overlay, p0, p1, color, 1, cv2.LINE_AA)
-
-    xi = np.floor(x_min / x_step) * x_step
-    while xi <= x_max:
-        draw_line(xi, z_min, xi, z_max); xi += x_step
-    zi = np.floor(z_min / z_step) * z_step
-    while zi <= z_max:
-        draw_line(x_min, zi, x_max, zi); zi += z_step
-
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-
-def draw_speed_panel(frame, speed_history, ema_speed, t_now):
+def draw_speed_panel(frame, speed_history, ema_speed, t_now, frame_w, frame_h):
     pw, ph = PANEL_SIZE
-    x0 = w - pw - PANEL_MARGIN
-    y0 = h - ph - PANEL_MARGIN
+    x0 = frame_w - pw - PANEL_MARGIN
+    y0 = frame_h - ph - PANEL_MARGIN
     x1, y1 = x0 + pw, y0 + ph
 
     ov = frame.copy()
@@ -268,7 +231,6 @@ while cap.isOpened():
     # ── Draw road overlays ───────────────────────────────────────
     draw_road_overlay(frame, road_poly)
     cv2.polylines(frame, [src_rect], True, (0, 200, 200), 1)
-    draw_perspective_grid(frame, H)
 
     # ── Per-track drawing ────────────────────────────────────────
     for row in tracks:
@@ -323,7 +285,7 @@ while cap.isOpened():
         if not history[tid] or t_now - history[tid][-1][0] > 2.0:
             gp_trace.pop(tid, None)
 
-    draw_speed_panel(frame, speed_history, ema_speed, t_now)
+    draw_speed_panel(frame, speed_history, ema_speed, t_now, w, h)
 
     writer.write(frame)
     frame_idx += 1

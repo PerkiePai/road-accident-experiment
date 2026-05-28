@@ -201,7 +201,7 @@ class ManualCalibrator:
 
 
 if __name__ == "__main__":
-    cap = cv2.VideoCapture("../_in/accident_cm_in_p10.mp4")
+    cap = cv2.VideoCapture("../_in/car_100kmh.mp4")
 
     calib = ManualCalibrator(lane_width_m=7.0, road_depth_m=10.0)
     H, src = calib.calibrate(cap, save_path="H_manual.npy")
@@ -211,24 +211,4 @@ if __name__ == "__main__":
     print(src)
     print(f"track_poly = {len(calib.track_poly)} points")
 
-    # ── BEV verification ─────────────────────────────────────
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    ret, frame = cap.read()
-    if ret:
-        dbg = frame.copy()
-        pts = src.astype(int)
-        for i in range(4):
-            cv2.line(dbg, tuple(pts[i]), tuple(pts[(i + 1) % 4]), (0, 255, 0), 2)
-            cv2.circle(dbg, tuple(pts[i]), 6, (0, 0, 255), -1)
-        cv2.polylines(dbg, [calib.track_poly], True, (0, 255, 255), 2)
-        cv2.imwrite("calib_debug.png", dbg)
-
-        px_per_m = 20
-        out_w = int(calib.lane_width_m * px_per_m)
-        out_h = int(calib.road_depth_m * px_per_m)
-        S    = np.diag([px_per_m, px_per_m, 1.0]).astype(np.float64)
-        H_px = S @ calib.H
-        bev  = cv2.warpPerspective(frame, H_px, (out_w, out_h))
-        cv2.imwrite("bev_test.png", bev)
-        print(f"saved calib_debug.png and bev_test.png ({out_w}x{out_h} px)")
     cap.release()
