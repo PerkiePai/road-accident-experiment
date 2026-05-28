@@ -1,0 +1,16 @@
+# Input videos
+_in/
+
+# Model weights
+*.pt
+
+# Output videos and frames
+*/out/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude settings
+.claude/

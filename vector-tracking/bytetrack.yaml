@@ -1,0 +1,7 @@
+tracker_type: bytetrack
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.45    # low enough to track motorcycles; Layer B stitches false news
+track_buffer: 90          # 3 s of memory at 30 fps (default 30)
+match_thresh: 0.85        # looser IoU matching across short gaps
+fuse_score: True
