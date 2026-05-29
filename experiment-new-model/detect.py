@@ -11,13 +11,14 @@ from boxmot.trackers.deepocsort.deepocsort import DeepOcSort
 
 # ─── Config ────────────────────────────────────────────────────
 INPUT_VIDEO  = "../_in/car_100kmh.mp4"
-OUTPUT_VIDEO = "out/car_100kmh_exp.mp4"
+OUTPUT_VIDEO = "out/car_100kmh_exp_4.mp4"
 H_PATH       = "H_manual.npy"
 SRC_PATH     = "src_manual.npy"
 TRACK_PATH   = "track_manual.npy"
 
 VEHICLE_CLASSES      = [2, 3, 5, 7]   # car, motorcycle, bus, truck
-CONF                 = 0.30
+CONF                 = 0.40
+IOU                  = 0.40
 HISTORY_SEC          = 5.0
 TRACE_SEC            = 2.5
 SPEED_WINDOW         = 0.5
@@ -25,6 +26,8 @@ EMA_ALPHA            = 0.1
 PANEL_SIZE           = (340, 200)
 PANEL_MARGIN         = 20
 PANEL_VMAX_KMH_FLOOR = 120
+WORLD_MERGE_DIST_M   = 5.0    # ground-plane match radius (metres) — generous since no two vehicles are close in this video
+WORLD_MERGE_GAP_S    = 1.5   # how long a lost canonical stays a match candidate
 
 # ─── Calibration ───────────────────────────────────────────────
 for p in (H_PATH, SRC_PATH, TRACK_PATH):
@@ -59,11 +62,13 @@ detector = RTDETR("rtdetr-l.pt")
 tracker = DeepOcSort(
     reid_model=None,
     embedding_off=False,
-    w_association_emb=0.6,
+    w_association_emb=0.2,   # autotune best: rely heavily on position
     Q_xy_scaling=0.08,
     Q_s_scaling=0.0004,
     delta_t=3,
     inertia=0.2,
+    min_hits=1,
+    max_age=60,
 )
 
 # ─── Feature extractor: ResNet-18 ──────────────────────────────
@@ -106,6 +111,153 @@ speed_history = defaultdict(lambda: deque(maxlen=int(fps * HISTORY_SEC)))
 gp_trace     = defaultdict(lambda: deque(maxlen=int(fps * TRACE_SEC) + 1))
 
 # ─── Helpers ───────────────────────────────────────────────────
+def nms_tracks(tracks, iou_thresh=0.50):
+    """Post-tracking NMS: if two track boxes overlap > iou_thresh, drop the
+    one with lower confidence so the same vehicle doesn't get two drawn IDs."""
+    if len(tracks) == 0:
+        return tracks
+    boxes = tracks[:, :4]
+    scores = tracks[:, 5]
+    order = scores.argsort()[::-1]
+    keep = []
+    suppressed = set()
+    for i in range(len(order)):
+        idx = order[i]
+        if idx in suppressed:
+            continue
+        keep.append(idx)
+        x1a, y1a, x2a, y2a = boxes[idx]
+        for j in range(i + 1, len(order)):
+            jdx = order[j]
+            if jdx in suppressed:
+                continue
+            x1b, y1b, x2b, y2b = boxes[jdx]
+            ix1, iy1 = max(x1a, x1b), max(y1a, y1b)
+            ix2, iy2 = min(x2a, x2b), min(y2a, y2b)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            area_a = (x2a - x1a) * (y2a - y1a)
+            area_b = (x2b - x1b) * (y2b - y1b)
+            union = area_a + area_b - inter
+            if union > 0 and inter / union > iou_thresh:
+                suppressed.add(jdx)
+    return tracks[sorted(keep)]
+
+class WorldMerger:
+    """Stable world-coordinate ID layer.
+
+    Two operating modes every frame:
+    1. Cross-frame: a new raw ID whose ground position falls within
+       WORLD_MERGE_DIST_M of a recently-lost canonical (extrapolated forward)
+       is aliased to that canonical.  This catches the alternating-track case
+       where the two IDs never appear in the same frame simultaneously.
+    2. Same-frame: two simultaneously-active canonicals within
+       WORLD_MERGE_DIST_M are merged (older absorbs newer).
+
+    Alias table is sticky — once assigned, a raw ID never changes canonical.
+    """
+
+    def __init__(self):
+        self.alias      = {}   # raw_tid -> canonical_tid
+        self.first_seen = {}   # canonical_tid -> frame_idx
+        # canonical_tid -> {'t': float, 'pos': (x,z), 'vel': (vx,vz)}
+        self.recent     = {}
+
+    def _extrapolate(self, state, t_now):
+        dt = t_now - state['t']
+        return (state['pos'][0] + state['vel'][0] * dt,
+                state['pos'][1] + state['vel'][1] * dt)
+
+    def _update_vel(self, cid, t, x, z):
+        prev = self.recent.get(cid)
+        if prev and (t - prev['t']) > 1e-3:
+            dt = t - prev['t']
+            vx = 0.5 * prev['vel'][0] + 0.5 * (x - prev['pos'][0]) / dt
+            vz = 0.5 * prev['vel'][1] + 0.5 * (z - prev['pos'][1]) / dt
+        else:
+            vx, vz = prev['vel'] if prev else (0.0, 0.0)
+        self.recent[cid] = {'t': t, 'pos': (x, z), 'vel': (vx, vz)}
+
+    def update(self, t_now, frame_idx, tid_pos_list):
+        """
+        tid_pos_list: [(tid, x_m, z_m), ...]
+        Returns: {tid: canonical_tid}
+        """
+        # Prune canonicals that have been lost too long
+        for cid in list(self.recent):
+            if t_now - self.recent[cid]['t'] > WORLD_MERGE_GAP_S:
+                del self.recent[cid]
+
+        # Phase 1 — resolve known aliases
+        frame_tracks = []   # (tid, canonical, x_m, z_m)
+        new_raw      = []   # (tid, x_m, z_m) — first time we see this raw ID
+        for tid, x_m, z_m in tid_pos_list:
+            if tid in self.alias:
+                frame_tracks.append((tid, self.alias[tid], x_m, z_m))
+            else:
+                new_raw.append((tid, x_m, z_m))
+
+        # Phase 2 — cross-frame match: new raw IDs vs recently-lost canonicals
+        active_cids = {can for _, can, _, _ in frame_tracks}
+        used        = set()
+        for tid, x_m, z_m in new_raw:
+            best_cid, best_dist = None, float('inf')
+            for cid, state in self.recent.items():
+                if cid in active_cids or cid in used:
+                    continue
+                px, pz = self._extrapolate(state, t_now)
+                dist   = float(np.hypot(x_m - px, z_m - pz))
+                if dist < WORLD_MERGE_DIST_M and dist < best_dist:
+                    best_cid, best_dist = cid, dist
+            if best_cid is not None:
+                used.add(best_cid)
+                self.alias[tid] = best_cid
+                frame_tracks.append((tid, best_cid, x_m, z_m))
+                active_cids.add(best_cid)
+            else:
+                self.alias[tid] = tid
+                self.first_seen.setdefault(tid, frame_idx)
+                frame_tracks.append((tid, tid, x_m, z_m))
+                active_cids.add(tid)
+
+        # Phase 3 — same-frame merge
+        seen_can = {}
+        for _, can, x_m, z_m in frame_tracks:
+            seen_can.setdefault(can, (x_m, z_m))
+
+        redirect = {}
+        can_list = list(seen_can.items())
+        for i in range(len(can_list)):
+            can_i, (xi, zi) = can_list[i]
+            root_i = redirect.get(can_i, can_i)
+            for j in range(i + 1, len(can_list)):
+                can_j, (xj, zj) = can_list[j]
+                root_j = redirect.get(can_j, can_j)
+                if root_i == root_j:
+                    continue
+                if np.hypot(xi - xj, zi - zj) < WORLD_MERGE_DIST_M:
+                    senior = root_i if self.first_seen.get(root_i, 0) <= self.first_seen.get(root_j, 0) else root_j
+                    junior = root_j if senior == root_i else root_i
+                    redirect[junior] = senior
+                    self.first_seen.pop(junior, None)
+
+        # Apply redirects through alias table
+        for k in list(self.alias):
+            c = self.alias[k]
+            if c in redirect:
+                self.alias[k] = redirect[c]
+
+        out = {}
+        for tid, can, x_m, z_m in frame_tracks:
+            final = redirect.get(can, can)
+            self.alias[tid] = final
+            self._update_vel(final, t_now, x_m, z_m)
+            out[tid] = final
+        return out
+
+
+merger = WorldMerger()
+
+
 def color_for_id(tid):
     h_ = (int(tid) * 0.61803398875) % 1.0
     r, g, b = colorsys.hsv_to_rgb(h_, 0.85, 1.0)
@@ -212,7 +364,8 @@ while cap.isOpened():
     t_now = frame_idx / fps
 
     # ── Detect (RT-DETR-l, no NMS) ──────────────────────────────
-    results = detector(frame, classes=VEHICLE_CLASSES, conf=CONF, verbose=False)
+    results = detector(frame, classes=VEHICLE_CLASSES, conf=CONF, iou=IOU,
+                       agnostic_nms=True, verbose=False)
     boxes   = results[0].boxes
 
     if boxes is not None and len(boxes):
@@ -227,41 +380,56 @@ while cap.isOpened():
 
     # ── Track (Deep OC-SORT + ResNet-18 ReID) ───────────────────
     tracks = tracker.update(dets, frame, embs)  # (M,8): x1,y1,x2,y2,id,conf,cls,det_ind
+    tracks = nms_tracks(tracks, iou_thresh=0.40)  # autotune best config
 
     # ── Draw road overlays ───────────────────────────────────────
     draw_road_overlay(frame, road_poly)
     cv2.polylines(frame, [src_rect], True, (0, 200, 200), 1)
 
-    # ── Per-track drawing ────────────────────────────────────────
+    # ── Pass 1: collect on-road tracks with ground positions ─────
+    on_road = []  # (tid, x1, y1, x2, y2, gx, gy, x_m, z_m)
     for row in tracks:
         x1, y1, x2, y2, tid, conf_, cls_, _ = row
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
         tid = int(tid)
         gx  = (x1 + x2) // 2
         gy  = y2
-
-        # off-road → dim ghost, skip speed/trail
         if cv2.pointPolygonTest(road_poly, (float(gx), float(gy)), False) < 0:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (100, 100, 100), 1)
             continue
-
-        color     = color_for_id(tid)
         x_m, z_m = project_to_ground(gx, gy)
+        on_road.append((tid, x1, y1, x2, y2, gx, gy, x_m, z_m))
 
-        # speed
-        history[tid].append((t_now, x_m, z_m))
-        v = speed_from_history(history[tid], SPEED_WINDOW)
+    # ── World-coordinate merge: collapse same-vehicle duplicate IDs ─
+    world_remap = merger.update(
+        t_now, frame_idx,
+        [(tid, x_m, z_m) for tid, _, _, _, _, _, _, x_m, z_m in on_road],
+    )
+
+    # ── Pass 2: draw with canonical IDs ──────────────────────────
+    # Guard: skip duplicate canonical IDs within this frame (both tracks
+    # mapped to the same canonical — only draw once, prefer first occurrence)
+    drawn_cids = set()
+    for tid, x1, y1, x2, y2, gx, gy, x_m, z_m in on_road:
+        cid = world_remap[tid]
+        if cid in drawn_cids:
+            continue
+        drawn_cids.add(cid)
+
+        color = color_for_id(cid)
+
+        history[cid].append((t_now, x_m, z_m))
+        v = speed_from_history(history[cid], SPEED_WINDOW)
         if v is not None:
-            prev_ema     = ema_speed.get(tid, v)
-            ema_speed[tid] = (1 - EMA_ALPHA) * prev_ema + EMA_ALPHA * v
-            speed_history[tid].append((t_now, ema_speed[tid]))
-            label = f"id{tid}  {v:.0f}km/h  d={z_m:.1f}m"
+            prev_ema       = ema_speed.get(cid, v)
+            ema_speed[cid] = (1 - EMA_ALPHA) * prev_ema + EMA_ALPHA * v
+            speed_history[cid].append((t_now, ema_speed[cid]))
+            label = f"id{cid}  {v:.0f}km/h  d={z_m:.1f}m"
         else:
-            label = f"id{tid}  d={z_m:.1f}m"
+            label = f"id{cid}  d={z_m:.1f}m"
 
-        # fading trail
-        gp_trace[tid].append((t_now, gx, gy))
-        trail = [(px, py) for t, px, py in gp_trace[tid] if t_now - t <= TRACE_SEC]
+        gp_trace[cid].append((t_now, gx, gy))
+        trail = [(px, py) for t, px, py in gp_trace[cid] if t_now - t <= TRACE_SEC]
         n     = len(trail)
         if n >= 2:
             for i in range(1, n):
