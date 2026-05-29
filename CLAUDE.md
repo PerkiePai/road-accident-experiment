@@ -96,7 +96,8 @@ The alias table is **sticky** — a raw ID's canonical never changes once assign
 |---|---|
 | `SPEED_WINDOW` | Seconds of history used for finite-diff speed |
 | `EMA_ALPHA` | Smoothing weight for per-track EMA speed |
-| `WORLD_MERGE_DIST_M` | Ground-plane match radius for `WorldMerger` (metres) |
+| `WORLD_MERGE_DIST_M` | Phase 2 cross-frame match radius for `WorldMerger` (metres) |
+| `WORLD_SAME_FRAME_M` | Phase 3 same-frame merge radius — must be tight (≤2 m) to avoid merging adjacent-lane vehicles that appear close at long range |
 | `WORLD_MERGE_GAP_S` | How long a lost canonical stays a match candidate (seconds) |
 | `PANEL_VMAX_KMH_FLOOR` | Minimum y-axis ceiling on the speed chart |
 

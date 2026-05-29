@@ -26,7 +26,8 @@ EMA_ALPHA            = 0.1
 PANEL_SIZE           = (340, 200)
 PANEL_MARGIN         = 20
 PANEL_VMAX_KMH_FLOOR = 120
-WORLD_MERGE_DIST_M   = 5.0    # ground-plane match radius (metres) — generous since no two vehicles are close in this video
+WORLD_MERGE_DIST_M   = 5.0    # Phase 2 cross-frame match radius (metres)
+WORLD_SAME_FRAME_M   = 1.5   # Phase 3 same-frame merge radius — much tighter to avoid merging adjacent-lane vehicles
 WORLD_MERGE_GAP_S    = 1.5   # how long a lost canonical stays a match candidate
 
 # ─── Calibration ───────────────────────────────────────────────
@@ -43,6 +44,8 @@ road_poly = np.load(TRACK_PATH).astype(np.int32)
 
 # ─── Video I/O ─────────────────────────────────────────────────
 os.makedirs("out", exist_ok=True)
+if os.path.exists(OUTPUT_VIDEO):
+    os.remove(OUTPUT_VIDEO)
 cap = cv2.VideoCapture(INPUT_VIDEO)
 if not cap.isOpened():
     raise SystemExit(f"Cannot open {INPUT_VIDEO}")
@@ -154,18 +157,36 @@ class WorldMerger:
        WORLD_MERGE_DIST_M are merged (older absorbs newer).
 
     Alias table is sticky — once assigned, a raw ID never changes canonical.
+
+    H_inv + road_poly are used to prune candidates whose extrapolated
+    ground position has left the tracking zone, preventing a departing
+    vehicle's canonical from being stolen by the next vehicle behind it.
     """
 
-    def __init__(self):
-        self.alias      = {}   # raw_tid -> canonical_tid
-        self.first_seen = {}   # canonical_tid -> frame_idx
+    def __init__(self, H_inv=None, road_poly=None):
+        self.alias           = {}   # raw_tid -> canonical_tid
+        self.alias_last_seen = {}   # raw_tid -> t_now when last active
+        self.first_seen      = {}   # canonical_tid -> frame_idx
         # canonical_tid -> {'t': float, 'pos': (x,z), 'vel': (vx,vz)}
-        self.recent     = {}
+        self.recent          = {}
+        self._H_inv          = H_inv
+        self._road_poly      = road_poly
 
     def _extrapolate(self, state, t_now):
         dt = t_now - state['t']
         return (state['pos'][0] + state['vel'][0] * dt,
                 state['pos'][1] + state['vel'][1] * dt)
+
+    def _in_road(self, x_m, z_m):
+        """Return True if world point (x_m, z_m) projects inside road_poly."""
+        if self._H_inv is None or self._road_poly is None:
+            return True
+        px = cv2.perspectiveTransform(
+            np.array([[[x_m, z_m]]], dtype=np.float32), self._H_inv
+        )[0, 0]
+        return cv2.pointPolygonTest(
+            self._road_poly, (float(px[0]), float(px[1])), False
+        ) >= 0
 
     def _update_vel(self, cid, t, x, z):
         prev = self.recent.get(cid)
@@ -182,17 +203,53 @@ class WorldMerger:
         tid_pos_list: [(tid, x_m, z_m), ...]
         Returns: {tid: canonical_tid}
         """
-        # Prune canonicals that have been lost too long
+        # Prune: stale by time, or extrapolated position has left the road
         for cid in list(self.recent):
-            if t_now - self.recent[cid]['t'] > WORLD_MERGE_GAP_S:
+            st = self.recent[cid]
+            if t_now - st['t'] > WORLD_MERGE_GAP_S:
+                del self.recent[cid]
+                continue
+            px, pz = self._extrapolate(st, t_now)
+            if not self._in_road(px, pz):
                 del self.recent[cid]
 
-        # Phase 1 — resolve known aliases
+        # Phase 1 — resolve known aliases.
+        # An alias is valid only if:
+        #   (a) the raw ID was seen recently (time-based expiry catches tracker
+        #       ID reuse after a long absence), AND
+        #   (b) the canonical is still in `recent` (it hasn't been pruned for
+        #       leaving the road — catches the case where the tracker reuses a
+        #       departed vehicle's raw ID for the very next vehicle).
         frame_tracks = []   # (tid, canonical, x_m, z_m)
-        new_raw      = []   # (tid, x_m, z_m) — first time we see this raw ID
+        new_raw      = []   # (tid, x_m, z_m) — treat as unknown this frame
         for tid, x_m, z_m in tid_pos_list:
             if tid in self.alias:
-                frame_tracks.append((tid, self.alias[tid], x_m, z_m))
+                can         = self.alias[tid]
+                last_seen   = self.alias_last_seen.get(tid, 0)
+                still_fresh = t_now - last_seen <= WORLD_MERGE_GAP_S
+                still_active = can in self.recent
+
+                # Direction gate in Phase 1: if the detection is significantly
+                # *behind* the canonical's extrapolated trajectory, it's a
+                # different vehicle (e.g. tracker reused the departing vehicle's
+                # raw ID for the next vehicle following it).
+                behind = False
+                if still_fresh and still_active:
+                    state     = self.recent[can]
+                    px, pz    = self._extrapolate(state, t_now)
+                    vel_speed = float(np.hypot(*state['vel']))
+                    if vel_speed > 1.0:
+                        dot = ((x_m - px) * state['vel'][0] +
+                               (z_m - pz) * state['vel'][1]) / vel_speed
+                        if dot < -WORLD_MERGE_DIST_M:
+                            behind = True
+
+                if still_fresh and still_active and not behind:
+                    self.alias_last_seen[tid] = t_now
+                    frame_tracks.append((tid, can, x_m, z_m))
+                else:
+                    del self.alias[tid]
+                    new_raw.append((tid, x_m, z_m))
             else:
                 new_raw.append((tid, x_m, z_m))
 
@@ -206,15 +263,25 @@ class WorldMerger:
                     continue
                 px, pz = self._extrapolate(state, t_now)
                 dist   = float(np.hypot(x_m - px, z_m - pz))
-                if dist < WORLD_MERGE_DIST_M and dist < best_dist:
-                    best_cid, best_dist = cid, dist
+                vel_speed = float(np.hypot(*state['vel']))
+                dot = None
+                if vel_speed > 1.0:
+                    dot = ((x_m - px) * state['vel'][0] +
+                           (z_m - pz) * state['vel'][1]) / vel_speed
+                if dist >= WORLD_MERGE_DIST_M or dist >= best_dist:
+                    continue
+                if dot is not None and dot < -WORLD_MERGE_DIST_M:
+                    continue
+                best_cid, best_dist = cid, dist
             if best_cid is not None:
                 used.add(best_cid)
                 self.alias[tid] = best_cid
+                self.alias_last_seen[tid] = t_now
                 frame_tracks.append((tid, best_cid, x_m, z_m))
                 active_cids.add(best_cid)
             else:
                 self.alias[tid] = tid
+                self.alias_last_seen[tid] = t_now
                 self.first_seen.setdefault(tid, frame_idx)
                 frame_tracks.append((tid, tid, x_m, z_m))
                 active_cids.add(tid)
@@ -234,7 +301,7 @@ class WorldMerger:
                 root_j = redirect.get(can_j, can_j)
                 if root_i == root_j:
                     continue
-                if np.hypot(xi - xj, zi - zj) < WORLD_MERGE_DIST_M:
+                if np.hypot(xi - xj, zi - zj) < WORLD_SAME_FRAME_M:
                     senior = root_i if self.first_seen.get(root_i, 0) <= self.first_seen.get(root_j, 0) else root_j
                     junior = root_j if senior == root_i else root_i
                     redirect[junior] = senior
@@ -255,7 +322,7 @@ class WorldMerger:
         return out
 
 
-merger = WorldMerger()
+merger = WorldMerger(H_inv=np.linalg.inv(H), road_poly=road_poly)
 
 
 def color_for_id(tid):
