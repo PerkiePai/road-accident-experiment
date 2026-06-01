@@ -10,8 +10,8 @@ from ultralytics import RTDETR
 from boxmot.trackers.deepocsort.deepocsort import DeepOcSort
 
 # ─── Config ────────────────────────────────────────────────────
-INPUT_VIDEO  = "../_in/car_100kmh.mp4"
-OUTPUT_VIDEO = "out/car_100kmh_exp_recon.mp4"
+INPUT_VIDEO  = "../_in/accident_cm_in_p10.mp4"
+OUTPUT_VIDEO = "out/accident_cm_in_p10_exp_recon.mp4"
 H_PATH       = "H_manual.npy"
 SRC_PATH     = "src_manual.npy"
 TRACK_PATH   = "track_manual.npy"
@@ -27,6 +27,13 @@ PANEL_SIZE           = (340, 200)
 PANEL_MARGIN         = 20
 PANEL_VMAX_KMH_FLOOR = 120
 WORLD_MERGE_DIST_M   = 5.0    # Phase 2 cross-frame match radius (metres)
+WORLD_STATIONARY_M   = 2.0   # tighter Phase 2 radius for near-stationary canonicals — a parked
+                              # car's continuation is at the same spot, so the loose moving-radius
+                              # must not let it absorb a passing vehicle (causes teleport speed spikes)
+WORLD_STATIONARY_VEL = 1.0   # m/s below which a canonical counts as stationary (also gates direction)
+WORLD_MAX_MERGE_VEL  = 50.0  # m/s (180 km/h) hard ceiling — reject a cross-frame merge that would
+                              # require the object to teleport faster than any road vehicle. Robust
+                              # to a canonical's own corrupted velocity estimate (jittery edge boxes).
 WORLD_SAME_FRAME_M   = 1.5   # Phase 3 same-frame merge radius — much tighter to avoid merging adjacent-lane vehicles
 WORLD_MERGE_GAP_S    = 1.5   # how long a lost canonical stays a match candidate
 
@@ -36,6 +43,7 @@ WORLD_MERGE_GAP_S    = 1.5   # how long a lost canonical stays a match candidate
 # best of hold/lin/invlin in validate_reconstruct.py).  Confidence decays over
 # the horizon; beyond it the speed coasts instead of dipping.
 EDGE_EPS_PX          = 3      # box edge within this many px of the border = clipped
+EXIT_MARGIN_PX       = 60     # within this of a border = "exiting scene", keep an on-road track
 RECON_HIST           = 10     # clean box-height samples kept per track
 RECON_FIT_L          = 8      # samples used in the linear height fit
 RECON_MIN_HIST       = 5      # need at least this many clean samples to reconstruct
@@ -284,10 +292,21 @@ class WorldMerger:
                 dist   = float(np.hypot(x_m - px, z_m - pz))
                 vel_speed = float(np.hypot(*state['vel']))
                 dot = None
-                if vel_speed > 1.0:
+                if vel_speed > WORLD_STATIONARY_VEL:
                     dot = ((x_m - px) * state['vel'][0] +
                            (z_m - pz) * state['vel'][1]) / vel_speed
-                if dist >= WORLD_MERGE_DIST_M or dist >= best_dist:
+                # Physical-plausibility gate: reject a match that would require the
+                # object to teleport from its last actual position faster than any
+                # road vehicle.  Robust even when this canonical's velocity estimate
+                # is corrupted (e.g. a jittery edge box flicking between positions).
+                dt_cand  = t_now - state['t']
+                dist_raw = float(np.hypot(x_m - state['pos'][0], z_m - state['pos'][1]))
+                if dt_cand > 1e-3 and dist_raw > WORLD_MAX_MERGE_VEL * dt_cand:
+                    continue
+                # A stationary canonical has no extrapolation slack, so it must
+                # not reach across the loose moving-radius to grab a passer-by.
+                radius = WORLD_MERGE_DIST_M if vel_speed > WORLD_STATIONARY_VEL else WORLD_STATIONARY_M
+                if dist >= radius or dist >= best_dist:
                     continue
                 if dot is not None and dot < -WORLD_MERGE_DIST_M:
                     continue
@@ -531,14 +550,24 @@ while cap.isOpened():
                        or y1 <= EDGE_EPS_PX)                       # top clipped
         gy, recon_conf = ground_y(tid, t_now, y1, y2, clip_bottom, clip_block)
 
-        # On-road gate.  For clean frames test the pixel ground point and
-        # remember the result; for clipped frames the reconstructed contact is
-        # off-screen (fails the pixel test), so reuse the last clean status.
-        if not clip_bottom and not clip_block:
-            on = cv2.pointPolygonTest(road_poly, (float(gx), float(gy)), False) >= 0
-            was_on_road[tid] = on
+        # On-road gate.  Test the OBSERVED bottom-centre (clamped to the frame)
+        # against the ROI — the reconstructed gy is off-screen and would always
+        # fail.  A track that has left the ROI is dropped only if it is NOT near
+        # a frame border; if it is near a border and was recently on-road it is
+        # *exiting the scene* (e.g. driving out the bottom), so we keep tracking
+        # and reconstructing it instead of greying it out.
+        gy_obs    = min(int(y2), h - 1)
+        near_edge = (y2 >= h - EXIT_MARGIN_PX or y1 <= EXIT_MARGIN_PX
+                     or x1 <= EXIT_MARGIN_PX or x2 >= w - EXIT_MARGIN_PX)
+        inside    = cv2.pointPolygonTest(road_poly, (float(gx), float(gy_obs)), False) >= 0
+        if inside:
+            on = True
+            was_on_road[tid] = True
+        elif near_edge and was_on_road.get(tid, False):
+            on = True                       # exiting through a frame border
         else:
-            on = was_on_road.get(tid, False)
+            on = False
+            was_on_road[tid] = False
         if not on:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (100, 100, 100), 1)
             continue
@@ -578,9 +607,13 @@ while cap.isOpened():
             v = None
 
         if os.environ.get("DUMP_TRACE"):
+            _cb = int(y2 >= h - EDGE_EPS_PX)
+            _cblk = int(x1 <= EDGE_EPS_PX or x2 >= w - EDGE_EPS_PX or y1 <= EDGE_EPS_PX)
             _trace_rows.append((frame_idx, round(t_now, 3), cid, round(recon_conf, 2),
                                 round(v, 1) if v is not None else "",
-                                round(ema_speed.get(cid, float('nan')), 1)))
+                                round(ema_speed.get(cid, float('nan')), 1),
+                                y1, y2, gx, round(gy, 1), round(x_m, 2), round(z_m, 2),
+                                _cb, _cblk))
 
         if recon_conf <= 0:
             spd   = ema_speed.get(cid)
@@ -642,6 +675,7 @@ if os.environ.get("DUMP_TRACE"):
     import csv as _csv
     with open("out/detect_speed_trace.csv", "w", newline="") as _f:
         _w = _csv.writer(_f)
-        _w.writerow(["frame", "t", "cid", "recon_conf", "v_kmh", "ema_kmh"])
+        _w.writerow(["frame", "t", "cid", "recon_conf", "v_kmh", "ema_kmh",
+                     "y1", "y2", "gx", "gy", "x_m", "z_m", "clip_b", "clip_blk"])
         _w.writerows(_trace_rows)
     print("Wrote out/detect_speed_trace.csv")
