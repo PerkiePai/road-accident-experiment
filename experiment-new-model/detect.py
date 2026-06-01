@@ -11,7 +11,7 @@ from boxmot.trackers.deepocsort.deepocsort import DeepOcSort
 
 # ─── Config ────────────────────────────────────────────────────
 INPUT_VIDEO  = "../_in/car_100kmh.mp4"
-OUTPUT_VIDEO = "out/car_100kmh_exp_4.mp4"
+OUTPUT_VIDEO = "out/car_100kmh_exp_recon.mp4"
 H_PATH       = "H_manual.npy"
 SRC_PATH     = "src_manual.npy"
 TRACK_PATH   = "track_manual.npy"
@@ -29,6 +29,18 @@ PANEL_VMAX_KMH_FLOOR = 120
 WORLD_MERGE_DIST_M   = 5.0    # Phase 2 cross-frame match radius (metres)
 WORLD_SAME_FRAME_M   = 1.5   # Phase 3 same-frame merge radius — much tighter to avoid merging adjacent-lane vehicles
 WORLD_MERGE_GAP_S    = 1.5   # how long a lost canonical stays a match candidate
+
+# Bottom reconstruction for cars exiting the frame.  When the box bottom clips
+# the frame border the tyre-contact point is unobservable, so we reconstruct it
+# as y2 = y1 + extrapolated box-height (linear-in-time fit, validated as the
+# best of hold/lin/invlin in validate_reconstruct.py).  Confidence decays over
+# the horizon; beyond it the speed coasts instead of dipping.
+EDGE_EPS_PX          = 3      # box edge within this many px of the border = clipped
+RECON_HIST           = 10     # clean box-height samples kept per track
+RECON_FIT_L          = 8      # samples used in the linear height fit
+RECON_MIN_HIST       = 5      # need at least this many clean samples to reconstruct
+RECON_MAX_HORIZON    = 6      # max consecutive clipped frames to keep reconstructing
+RECON_GAP_RESET_S    = 1.0    # reset a track's box history after a gap (tracker id reuse)
 
 # ─── Calibration ───────────────────────────────────────────────
 for p in (H_PATH, SRC_PATH, TRACK_PATH):
@@ -112,6 +124,13 @@ history      = defaultdict(lambda: deque(maxlen=int(fps * HISTORY_SEC)))
 ema_speed    = {}
 speed_history = defaultdict(lambda: deque(maxlen=int(fps * HISTORY_SEC)))
 gp_trace     = defaultdict(lambda: deque(maxlen=int(fps * TRACE_SEC) + 1))
+
+# Bottom-reconstruction state, keyed by RAW tracker id (box geometry is a
+# property of the raw track, and we reconstruct before WorldMerger remaps ids).
+box_hist     = defaultdict(lambda: deque(maxlen=RECON_HIST))  # tid -> deque[(t, hbox)]
+box_seen_t   = {}                                             # tid -> last t seen
+clip_age     = defaultdict(int)                               # tid -> consecutive clipped frames
+was_on_road  = {}                                             # tid -> last clean on-road status
 
 # ─── Helpers ───────────────────────────────────────────────────
 def nms_tracks(tracks, iou_thresh=0.50):
@@ -349,6 +368,50 @@ def speed_from_history(hist, window_sec):
         return None
     return np.hypot(x_now - x_old, z_now - z_old) / dt * 3.6
 
+def ground_y(tid, t_now, y1, y2, clip_bottom, clip_block):
+    """Decide the tyre-contact y for one raw track and report confidence.
+
+    Maintains a per-track history of clean (unclipped) box heights.  When the
+    bottom is clipped, reconstruct y2 = y1 + linear-extrapolated box height.
+
+    clip_block: side or top is clipped — y1 and/or the box height are corrupted,
+                so reconstruction is not attempted.
+
+    Returns (gy, conf).  conf in [0, 1]; conf == 0 means no trustworthy contact
+    point (caller should coast rather than measure).
+    """
+    # Reset history if the tracker reused this id after a gap (different vehicle).
+    last = box_seen_t.get(tid)
+    if last is not None and t_now - last > RECON_GAP_RESET_S:
+        box_hist[tid].clear()
+        clip_age[tid] = 0
+        was_on_road.pop(tid, None)
+    box_seen_t[tid] = t_now
+
+    hbox = y2 - y1
+    if not clip_bottom and not clip_block:
+        box_hist[tid].append((t_now, hbox))   # clean observation
+        clip_age[tid] = 0
+        return float(y2), 1.0
+
+    clip_age[tid] += 1
+    if clip_block:
+        return float(y2), 0.0                  # side/top clipped — cannot reconstruct
+
+    hist = list(box_hist[tid])
+    if len(hist) < RECON_MIN_HIST or clip_age[tid] > RECON_MAX_HORIZON:
+        return float(y2), 0.0                  # too little history, or past horizon
+
+    ts = np.array([p[0] for p in hist[-RECON_FIT_L:]])
+    hs = np.array([p[1] for p in hist[-RECON_FIT_L:]])
+    b, a = np.polyfit(ts, hs, 1)
+    hbox_pred = a + b * t_now
+    if hbox_pred <= 0:
+        return float(y2), 0.0
+    y2_recon = y1 + hbox_pred
+    conf = max(0.0, 1.0 - (clip_age[tid] - 1) / RECON_MAX_HORIZON)
+    return float(y2_recon), conf
+
 def draw_road_overlay(frame, poly):
     ov = frame.copy()
     cv2.fillPoly(ov, [poly], (255, 200, 0))
@@ -422,6 +485,7 @@ print(f"Input : {INPUT_VIDEO}  ({total_frames} frames @ {fps:.1f} fps)")
 print(f"Output: {OUTPUT_VIDEO}")
 print(f"Device: {_feat_device}")
 
+_trace_rows = []
 frame_idx = 0
 while cap.isOpened():
     ret, frame = cap.read()
@@ -454,30 +518,45 @@ while cap.isOpened():
     cv2.polylines(frame, [src_rect], True, (0, 200, 200), 1)
 
     # ── Pass 1: collect on-road tracks with ground positions ─────
-    on_road = []  # (tid, x1, y1, x2, y2, gx, gy, x_m, z_m)
+    on_road = []  # (tid, x1, y1, x2, y2, gx, gy, x_m, z_m, conf)
     for row in tracks:
         x1, y1, x2, y2, tid, conf_, cls_, _ = row
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
         tid = int(tid)
         gx  = (x1 + x2) // 2
-        gy  = y2
-        if cv2.pointPolygonTest(road_poly, (float(gx), float(gy)), False) < 0:
+
+        # Reconstruct the tyre-contact y if the box bottom clips the frame.
+        clip_bottom = y2 >= h - EDGE_EPS_PX
+        clip_block  = (x1 <= EDGE_EPS_PX or x2 >= w - EDGE_EPS_PX  # side clipped
+                       or y1 <= EDGE_EPS_PX)                       # top clipped
+        gy, recon_conf = ground_y(tid, t_now, y1, y2, clip_bottom, clip_block)
+
+        # On-road gate.  For clean frames test the pixel ground point and
+        # remember the result; for clipped frames the reconstructed contact is
+        # off-screen (fails the pixel test), so reuse the last clean status.
+        if not clip_bottom and not clip_block:
+            on = cv2.pointPolygonTest(road_poly, (float(gx), float(gy)), False) >= 0
+            was_on_road[tid] = on
+        else:
+            on = was_on_road.get(tid, False)
+        if not on:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (100, 100, 100), 1)
             continue
+
         x_m, z_m = project_to_ground(gx, gy)
-        on_road.append((tid, x1, y1, x2, y2, gx, gy, x_m, z_m))
+        on_road.append((tid, x1, y1, x2, y2, gx, gy, x_m, z_m, recon_conf))
 
     # ── World-coordinate merge: collapse same-vehicle duplicate IDs ─
     world_remap = merger.update(
         t_now, frame_idx,
-        [(tid, x_m, z_m) for tid, _, _, _, _, _, _, x_m, z_m in on_road],
+        [(tid, x_m, z_m) for tid, _, _, _, _, _, _, x_m, z_m, _ in on_road],
     )
 
     # ── Pass 2: draw with canonical IDs ──────────────────────────
     # Guard: skip duplicate canonical IDs within this frame (both tracks
     # mapped to the same canonical — only draw once, prefer first occurrence)
     drawn_cids = set()
-    for tid, x1, y1, x2, y2, gx, gy, x_m, z_m in on_road:
+    for tid, x1, y1, x2, y2, gx, gy, x_m, z_m, recon_conf in on_road:
         cid = world_remap[tid]
         if cid in drawn_cids:
             continue
@@ -485,17 +564,37 @@ while cap.isOpened():
 
         color = color_for_id(cid)
 
-        history[cid].append((t_now, x_m, z_m))
-        v = speed_from_history(history[cid], SPEED_WINDOW)
-        if v is not None:
-            prev_ema       = ema_speed.get(cid, v)
-            ema_speed[cid] = (1 - EMA_ALPHA) * prev_ema + EMA_ALPHA * v
-            speed_history[cid].append((t_now, ema_speed[cid]))
+        # Only update position/speed from a trustworthy contact point.  When the
+        # bottom is clipped beyond the reconstruction horizon (conf == 0) we
+        # coast on the last EMA speed instead of feeding a frozen/garbage point.
+        if recon_conf > 0:
+            history[cid].append((t_now, x_m, z_m))
+            v = speed_from_history(history[cid], SPEED_WINDOW)
+            if v is not None:
+                prev_ema       = ema_speed.get(cid, v)
+                ema_speed[cid] = (1 - EMA_ALPHA) * prev_ema + EMA_ALPHA * v
+                speed_history[cid].append((t_now, ema_speed[cid]))
+        else:
+            v = None
+
+        if os.environ.get("DUMP_TRACE"):
+            _trace_rows.append((frame_idx, round(t_now, 3), cid, round(recon_conf, 2),
+                                round(v, 1) if v is not None else "",
+                                round(ema_speed.get(cid, float('nan')), 1)))
+
+        if recon_conf <= 0:
+            spd   = ema_speed.get(cid)
+            label = (f"id{cid}  {spd:.0f}km/h coast" if spd is not None
+                     else f"id{cid}  d={z_m:.1f}m")
+        elif v is not None:
             label = f"id{cid}  {v:.0f}km/h  d={z_m:.1f}m"
+            if recon_conf < 1.0:
+                label += f"  rec{recon_conf:.1f}"
         else:
             label = f"id{cid}  d={z_m:.1f}m"
 
-        gp_trace[cid].append((t_now, gx, gy))
+        gy_px = int(round(gy))
+        gp_trace[cid].append((t_now, gx, gy_px))
         trail = [(px, py) for t, px, py in gp_trace[cid] if t_now - t <= TRACE_SEC]
         n     = len(trail)
         if n >= 2:
@@ -505,7 +604,7 @@ while cap.isOpened():
                 cv2.line(frame, trail[i-1], trail[i], seg_color, 2, cv2.LINE_AA)
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.circle(frame, (gx, gy), 5, (0, 255, 255), -1)
+        cv2.circle(frame, (gx, gy_px), 5, (0, 255, 255), -1)
         cv2.putText(frame, label, (x1, y1 - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
@@ -519,6 +618,12 @@ while cap.isOpened():
     for tid in list(gp_trace):
         if not history[tid] or t_now - history[tid][-1][0] > 2.0:
             gp_trace.pop(tid, None)
+    for tid in list(box_seen_t):
+        if t_now - box_seen_t[tid] > 2.0:
+            box_seen_t.pop(tid, None)
+            box_hist.pop(tid, None)
+            clip_age.pop(tid, None)
+            was_on_road.pop(tid, None)
 
     draw_speed_panel(frame, speed_history, ema_speed, t_now, w, h)
 
@@ -532,3 +637,11 @@ while cap.isOpened():
 cap.release()
 writer.release()
 print(f"\nWrote {OUTPUT_VIDEO} ({frame_idx} frames)")
+
+if os.environ.get("DUMP_TRACE"):
+    import csv as _csv
+    with open("out/detect_speed_trace.csv", "w", newline="") as _f:
+        _w = _csv.writer(_f)
+        _w.writerow(["frame", "t", "cid", "recon_conf", "v_kmh", "ema_kmh"])
+        _w.writerows(_trace_rows)
+    print("Wrote out/detect_speed_trace.csv")
