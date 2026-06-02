@@ -91,6 +91,12 @@ If two canonicals are simultaneously active and within `WORLD_MERGE_DIST_M`, the
 
 The alias table is **sticky** — a raw ID's canonical never changes once assigned. Redirects are propagated back through the full alias table so no stale pointer survives.
 
+### CTRV heading (CP4) — `ctrv_filter.py`
+
+`detect.py` runs a `CTRVFilter` (Constant Turn Rate & Velocity EKF) per **canonical** ID, fed the same trustworthy ground-contact point as the speed estimate (skipped when `recon_conf == 0`). Running on the WorldMerger-stabilised IDs avoids the heading state being fragmented by tracker ID switches. State is `[x, z, v, ψ, ω]` (ψ heading, 0→+z; ω yaw rate). Output: a perspective-correct yellow heading arrow on moving vehicles, the heading in each label (`…°`), and `heading_deg`/`yaw_deg_s` columns in the `DUMP_TRACE` CSV (the inputs CP5's accident trigger will consume).
+
+A **debounced motion gate** (on net displacement over a short window) is the key to stability: a stationary car's position jitter would otherwise be read as continuous turning and wind the heading up by full rotations. The filter declares "moving" only after `N_ON` sustained frames above `V_ON` (rejecting jitter spikes), reverts below `V_OFF`, and while stationary **holds** the last good heading with `ω = 0`. Yaw rate is clamped to `OMEGA_MAX`. Tune in `ctrv_filter.py` (module constants). Offline tuning replays `out/detect_speed_trace.csv` through the filter with no GPU via `cp4_tune.py`.
+
 ### Key tuning constants (`experiment-new-model/detect.py`)
 | Constant | Purpose |
 |---|---|
@@ -100,6 +106,7 @@ The alias table is **sticky** — a raw ID's canonical never changes once assign
 | `WORLD_SAME_FRAME_M` | Phase 3 same-frame merge radius — must be tight (≤2 m) to avoid merging adjacent-lane vehicles that appear close at long range |
 | `WORLD_MERGE_GAP_S` | How long a lost canonical stays a match candidate (seconds) |
 | `PANEL_VMAX_KMH_FLOOR` | Minimum y-axis ceiling on the speed chart |
+| `HEADING_ARROW_M` | Length (metres) of the drawn CTRV heading arrow |
 
 ### Calibration geometry
 `ManualCalibrator(lane_width_m=7.0, road_depth_m=10.0)` — the destination rectangle for `findHomography` is always `[0,0] – [lane_width_m, road_depth_m]` in metres. Adjust these to match the actual road dimensions you clicked on.

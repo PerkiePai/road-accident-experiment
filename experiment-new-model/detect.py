@@ -8,10 +8,11 @@ import torchvision.models as tv_models
 import torchvision.transforms as tv_transforms
 from ultralytics import RTDETR
 from boxmot.trackers.deepocsort.deepocsort import DeepOcSort
+from ctrv_filter import CTRVFilter
 
 # ─── Config ────────────────────────────────────────────────────
-INPUT_VIDEO  = "../_in/accident_cm_in_p10.mp4"
-OUTPUT_VIDEO = "out/accident_cm_in_p10_exp_recon.mp4"
+INPUT_VIDEO  = os.environ.get("INPUT_VIDEO", "../_in/thai_road_full_cut.mp4")
+OUTPUT_VIDEO = os.environ.get("OUTPUT_VIDEO", "out/thai_road_full_cut_cp4.mp4")
 H_PATH       = "H_manual.npy"
 SRC_PATH     = "src_manual.npy"
 TRACK_PATH   = "track_manual.npy"
@@ -26,6 +27,15 @@ EMA_ALPHA            = 0.1
 PANEL_SIZE           = (340, 200)
 PANEL_MARGIN         = 20
 PANEL_VMAX_KMH_FLOOR = 120
+HEADING_ARROW_M      = 3.0    # length (metres) of the drawn CTRV heading arrow
+FAR_GATE_RATIO       = 8.0    # gate when the local world-scale (m/px) exceeds this
+                              # many times the near-field (well-resolved) m/px. A
+                              # pure ratio, so it transfers across calibrations of
+                              # any metric scale (unlike an absolute m/px threshold):
+                              # past it the contact point is too near the horizon —
+                              # a pixel of jitter maps to a large world step, spiking
+                              # BOTH heading and speed, so we hold heading and coast
+                              # speed (raw v still logged).
 WORLD_MERGE_DIST_M   = 5.0    # Phase 2 cross-frame match radius (metres)
 WORLD_STATIONARY_M   = 2.0   # tighter Phase 2 radius for near-stationary canonicals — a parked
                               # car's continuation is at the same spot, so the loose moving-radius
@@ -59,6 +69,7 @@ for p in (H_PATH, SRC_PATH, TRACK_PATH):
         )
 
 H         = np.load(H_PATH)
+H_inv     = np.linalg.inv(H)
 src_rect  = np.load(SRC_PATH).astype(np.int32)
 road_poly = np.load(TRACK_PATH).astype(np.int32)
 
@@ -132,6 +143,12 @@ history      = defaultdict(lambda: deque(maxlen=int(fps * HISTORY_SEC)))
 ema_speed    = {}
 speed_history = defaultdict(lambda: deque(maxlen=int(fps * HISTORY_SEC)))
 gp_trace     = defaultdict(lambda: deque(maxlen=int(fps * TRACE_SEC) + 1))
+
+# CTRV heading filter, keyed by CANONICAL id (runs on WorldMerger-stabilised
+# tracks so the heading state isn't fragmented by tracker ID switches).
+ctrv_filt    = {}   # cid -> CTRVFilter
+heading      = {}   # cid -> last heading (deg);  yaw_rate via the filter
+heading_history = defaultdict(lambda: deque(maxlen=int(fps * HISTORY_SEC)))
 
 # Bottom-reconstruction state, keyed by RAW tracker id (box geometry is a
 # property of the raw track, and we reconstruct before WorldMerger remaps ids).
@@ -380,7 +397,7 @@ class WorldMerger:
         return out
 
 
-merger = WorldMerger(H_inv=np.linalg.inv(H), road_poly=road_poly, frame_w=w, frame_h=h)
+merger = WorldMerger(H_inv=H_inv, road_poly=road_poly, frame_w=w, frame_h=h)
 
 
 def color_for_id(tid):
@@ -392,6 +409,37 @@ def project_to_ground(px, py):
     pt = np.array([[[px, py]]], dtype=np.float32)
     xz = cv2.perspectiveTransform(pt, H)[0, 0]
     return float(xz[0]), float(xz[1])
+
+def ground_to_px(x_m, z_m):
+    pt = np.array([[[x_m, z_m]]], dtype=np.float32)
+    px = cv2.perspectiveTransform(pt, H_inv)[0, 0]
+    return int(round(px[0])), int(round(px[1]))
+
+def local_scale_mpp(gx, gy):
+    """Metres of world distance per vertical pixel at this contact point.
+    Grows sharply toward the horizon — a robust, camera-independent proxy for
+    how much a 1px detection jitter corrupts the ground position (and heading)."""
+    a = project_to_ground(gx, gy)
+    b = project_to_ground(gx, gy - 1)
+    return float(np.hypot(b[0] - a[0], b[1] - a[1]))
+
+def _near_field_mpp(poly, n=48):
+    """Reference world-scale: the m/px of the best-resolved (near) ground inside
+    the tracking region. Used to make the far-gate a pure ratio, so it means the
+    same thing on any calibration regardless of its assigned metric scale."""
+    xs, ys = poly[:, 0], poly[:, 1]
+    vals = []
+    for gx in np.linspace(xs.min(), xs.max(), n):
+        for gy in np.linspace(ys.min(), ys.max(), n):
+            if cv2.pointPolygonTest(poly, (float(gx), float(gy)), False) >= 0:
+                vals.append(local_scale_mpp(gx, gy))
+    if not vals:
+        return 1e-9
+    return float(np.percentile(vals, 5))   # robust "best resolution" inside ROI
+
+MPP_REF = _near_field_mpp(road_poly)
+print(f"Far-gate: near-field m/px ref = {MPP_REF:.4f}  "
+      f"-> hold above {FAR_GATE_RATIO * MPP_REF:.3f} m/px ({FAR_GATE_RATIO:.0f}x)")
 
 def speed_from_history(hist, window_sec):
     if len(hist) < 2:
@@ -519,6 +567,75 @@ def draw_speed_panel(frame, speed_history, ema_speed, t_now, frame_w, frame_h):
         cv2.putText(frame, f"+{len(active_ids)-5}", (lx, y0 + 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (220, 220, 220), 1, cv2.LINE_AA)
 
+
+def draw_direction_panel(frame, heading_history, t_now, frame_w, frame_h):
+    """Bottom-left companion to the speed panel: per-track TURN RATE (rate of
+    direction change, deg/s) vs time over the last HISTORY_SEC.  Centred on a
+    zero line — straight driving runs flat along it, a turn or collision
+    deflects up/down.  Y-axis is symmetric and auto-scaled."""
+    pw, ph = PANEL_SIZE
+    x0 = PANEL_MARGIN
+    y0 = frame_h - ph - PANEL_MARGIN
+    x1, y1 = x0 + pw, y0 + ph
+
+    ov = frame.copy()
+    cv2.rectangle(ov, (x0, y0), (x1, y1), (20, 20, 20), -1)
+    cv2.addWeighted(ov, 0.65, frame, 0.35, 0, frame)
+    cv2.rectangle(frame, (x0, y0), (x1, y1), (200, 200, 200), 1)
+
+    pad_l, pad_r, pad_t, pad_b = 40, 8, 22, 18
+    px0, py0 = x0 + pad_l, y0 + pad_t
+    px1, py1 = x1 - pad_r, y1 - pad_b
+    plot_w, plot_h = px1 - px0, py1 - py0
+    pyc = py0 + plot_h // 2                     # zero (centre) line
+
+    # Auto-scale symmetric range from the data, floored so noise isn't amplified.
+    vmax = 30.0
+    for hh in heading_history.values():
+        for t, yaw in hh:
+            if t_now - t <= HISTORY_SEC:
+                vmax = max(vmax, abs(yaw))
+    vmax *= 1.1
+
+    cv2.putText(frame, "turn deg/s", (x0 + 4, y0 + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+    for i in range(-2, 3):                      # gridlines at -vmax..+vmax
+        val = vmax * i / 2
+        yy  = pyc - int((plot_h / 2) * i / 2)
+        shade = (110, 110, 110) if i == 0 else (70, 70, 70)
+        cv2.line(frame, (px0, yy), (px1, yy), shade, 1)
+        cv2.putText(frame, f"{int(val):+d}" if i else "0", (x0 + 4, yy + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA)
+
+    cv2.putText(frame, f"-{HISTORY_SEC:.0f}s", (px0, py1 + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(frame, "0", (px1 - 8, py1 + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+
+    active_ids = []
+    for tid, hh in heading_history.items():
+        if len(hh) < 2 or t_now - hh[-1][0] > 1.0:
+            continue
+        pts = []
+        for t, yaw in hh:
+            age = t_now - t
+            if age > HISTORY_SEC:
+                continue
+            fx = px1 - int(plot_w * (age / HISTORY_SEC))
+            fy = pyc - int((plot_h / 2) * max(-1.0, min(1.0, yaw / vmax)))
+            pts.append((fx, fy))
+        if len(pts) >= 2:
+            cv2.polylines(frame, [np.array(pts, np.int32)], False,
+                          color_for_id(tid), 2, cv2.LINE_AA)
+            active_ids.append(tid)
+
+    lx = x0 + 90
+    for tid in active_ids[:4]:
+        cv2.rectangle(frame, (lx, y0 + 6), (lx + 10, y0 + 14), color_for_id(tid), -1)
+        cv2.putText(frame, f"id{tid}", (lx + 14, y0 + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (220, 220, 220), 1, cv2.LINE_AA)
+        lx += 50
+
 # ─── Main loop ─────────────────────────────────────────────────
 print(f"Input : {INPUT_VIDEO}  ({total_frames} frames @ {fps:.1f} fps)")
 print(f"Output: {OUTPUT_VIDEO}")
@@ -613,34 +730,67 @@ while cap.isOpened():
 
         color = color_for_id(cid)
 
+        # Reliability of this contact point.  Near the horizon a single pixel of
+        # detection jitter maps to a large world step, spiking BOTH speed and
+        # heading, so we gate both on the same far-road test — expressed as a
+        # ratio to the near-field scale so it is calibration-scale-independent.
+        reliable = local_scale_mpp(gx, gy) <= FAR_GATE_RATIO * MPP_REF
+
         # Only update position/speed from a trustworthy contact point.  When the
         # bottom is clipped beyond the reconstruction horizon (conf == 0) we
         # coast on the last EMA speed instead of feeding a frozen/garbage point.
         if recon_conf > 0:
             history[cid].append((t_now, x_m, z_m))
-            v = speed_from_history(history[cid], SPEED_WINDOW)
-            if v is not None:
+            v = speed_from_history(history[cid], SPEED_WINDOW)   # raw — always logged
+            # Feed the EMA / panel only from reliable (near-road) points so a
+            # far-road jitter spike can't blow up the smoothed speed or the
+            # chart's y-axis.  The raw v above is still written to the trace CSV.
+            if v is not None and reliable:
                 prev_ema       = ema_speed.get(cid, v)
                 ema_speed[cid] = (1 - EMA_ALPHA) * prev_ema + EMA_ALPHA * v
                 speed_history[cid].append((t_now, ema_speed[cid]))
+            # CTRV heading on the same trustworthy point — held when unreliable.
+            if cid not in ctrv_filt:
+                ctrv_filt[cid] = CTRVFilter(dt=1.0 / fps)
+                ctrv_filt[cid].init(x_m, z_m)
+            if reliable:
+                h_new = ctrv_filt[cid].update(x_m, z_m)
+                # Only expose the heading once the filter has actually seeded a
+                # real direction.  During the onset delay it returns an arbitrary
+                # init (held 0 deg); showing that produces a wrong-way arrow that
+                # then snaps ~180 deg to the true heading once motion is confirmed.
+                if ctrv_filt[cid].has_heading:
+                    heading[cid] = h_new
+                    # Record turn rate (rate of direction change) for the panel,
+                    # only while genuinely moving — a parked car contributes zero.
+                    if ema_speed.get(cid, 0.0) > 5.0:
+                        heading_history[cid].append((t_now, ctrv_filt[cid].yaw_rate_deg))
         else:
             v = None
+        hd = heading.get(cid)
 
         if os.environ.get("DUMP_TRACE"):
             _cb = int(y2 >= h - EDGE_EPS_PX)
             _cblk = int(x1 <= EDGE_EPS_PX or x2 >= w - EDGE_EPS_PX or y1 <= EDGE_EPS_PX)
+            _yaw = ctrv_filt[cid].yaw_rate_deg if cid in ctrv_filt else float('nan')
             _trace_rows.append((frame_idx, round(t_now, 3), cid, round(recon_conf, 2),
                                 round(v, 1) if v is not None else "",
                                 round(ema_speed.get(cid, float('nan')), 1),
                                 y1, y2, gx, round(gy, 1), round(x_m, 2), round(z_m, 2),
-                                _cb, _cblk))
+                                _cb, _cblk,
+                                round(hd, 1) if hd is not None else "",
+                                round(_yaw, 1)))
 
-        if recon_conf <= 0:
+        if recon_conf <= 0 or not reliable:
+            # Far-road or clipped: show the coasted EMA (the raw spike is kept in
+            # the trace CSV, just not displayed or fed into the smoothed speed).
             spd   = ema_speed.get(cid)
             label = (f"id{cid}  {spd:.0f}km/h coast" if spd is not None
                      else f"id{cid}  d={z_m:.1f}m")
         elif v is not None:
             label = f"id{cid}  {v:.0f}km/h  d={z_m:.1f}m"
+            if hd is not None:
+                label += f"  {hd:.0f}°"
             if recon_conf < 1.0:
                 label += f"  rec{recon_conf:.1f}"
         else:
@@ -658,6 +808,18 @@ while cap.isOpened():
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         cv2.circle(frame, (gx, gy_px), 5, (0, 255, 255), -1)
+
+        # Heading arrow: project a point HEADING_ARROW_M ahead in world space and
+        # draw from the contact point, so it follows the road's perspective.
+        # Only for genuinely moving vehicles (heading is held/undefined at rest).
+        spd_kmh = ema_speed.get(cid)
+        if hd is not None and spd_kmh is not None and spd_kmh > 5.0:
+            psi  = np.radians(hd)
+            ahead = ground_to_px(x_m + HEADING_ARROW_M * np.sin(psi),
+                                 z_m + HEADING_ARROW_M * np.cos(psi))
+            cv2.arrowedLine(frame, (gx, gy_px), ahead, (0, 255, 255), 2,
+                            cv2.LINE_AA, tipLength=0.3)
+
         cv2.putText(frame, label, (x1, y1 - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
@@ -671,6 +833,13 @@ while cap.isOpened():
     for tid in list(gp_trace):
         if not history[tid] or t_now - history[tid][-1][0] > 2.0:
             gp_trace.pop(tid, None)
+    for tid in list(ctrv_filt):
+        if not history[tid] or t_now - history[tid][-1][0] > 2.0:
+            ctrv_filt.pop(tid, None)
+            heading.pop(tid, None)
+    for tid in list(heading_history):
+        if not history[tid] or t_now - history[tid][-1][0] > 2.0:
+            heading_history.pop(tid, None)
     for tid in list(box_seen_t):
         if t_now - box_seen_t[tid] > 2.0:
             box_seen_t.pop(tid, None)
@@ -679,6 +848,7 @@ while cap.isOpened():
             was_on_road.pop(tid, None)
 
     draw_speed_panel(frame, speed_history, ema_speed, t_now, w, h)
+    draw_direction_panel(frame, heading_history, t_now, w, h)
 
     writer.write(frame)
     frame_idx += 1
@@ -696,6 +866,7 @@ if os.environ.get("DUMP_TRACE"):
     with open("out/detect_speed_trace.csv", "w", newline="") as _f:
         _w = _csv.writer(_f)
         _w.writerow(["frame", "t", "cid", "recon_conf", "v_kmh", "ema_kmh",
-                     "y1", "y2", "gx", "gy", "x_m", "z_m", "clip_b", "clip_blk"])
+                     "y1", "y2", "gx", "gy", "x_m", "z_m", "clip_b", "clip_blk",
+                     "heading_deg", "yaw_deg_s"])
         _w.writerows(_trace_rows)
     print("Wrote out/detect_speed_trace.csv")
