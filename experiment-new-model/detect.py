@@ -190,7 +190,7 @@ class WorldMerger:
     vehicle's canonical from being stolen by the next vehicle behind it.
     """
 
-    def __init__(self, H_inv=None, road_poly=None):
+    def __init__(self, H_inv=None, road_poly=None, frame_w=None, frame_h=None):
         self.alias           = {}   # raw_tid -> canonical_tid
         self.alias_last_seen = {}   # raw_tid -> t_now when last active
         self.first_seen      = {}   # canonical_tid -> frame_idx
@@ -198,6 +198,8 @@ class WorldMerger:
         self.recent          = {}
         self._H_inv          = H_inv
         self._road_poly      = road_poly
+        self._fw             = frame_w
+        self._fh             = frame_h
 
     def _extrapolate(self, state, t_now):
         dt = t_now - state['t']
@@ -215,6 +217,18 @@ class WorldMerger:
             self._road_poly, (float(px[0]), float(px[1])), False
         ) >= 0
 
+    def _near_border_world(self, x_m, z_m):
+        """True if world point projects within EXIT_MARGIN_PX of a frame border
+        (or off-frame) — i.e. the canonical is exiting the scene."""
+        if self._H_inv is None or self._fw is None:
+            return False
+        px = cv2.perspectiveTransform(
+            np.array([[[x_m, z_m]]], dtype=np.float32), self._H_inv
+        )[0, 0]
+        x, y = float(px[0]), float(px[1])
+        m = EXIT_MARGIN_PX
+        return x <= m or y <= m or x >= self._fw - m or y >= self._fh - m
+
     def _update_vel(self, cid, t, x, z):
         prev = self.recent.get(cid)
         if prev and (t - prev['t']) > 1e-3:
@@ -230,14 +244,20 @@ class WorldMerger:
         tid_pos_list: [(tid, x_m, z_m), ...]
         Returns: {tid: canonical_tid}
         """
-        # Prune: stale by time, or extrapolated position has left the road
+        # Prune: stale by time, or extrapolated position has left the road —
+        # EXCEPT keep a canonical that is exiting via a frame border, so its own
+        # re-detected track can re-attach (otherwise the car gets a fresh id,
+        # e.g. id4->id10 after it passed the ROI's bottom edge). Theft by a
+        # following vehicle is still blocked by the distance/direction/teleport
+        # gates. Border test uses the LAST OBSERVED position because the
+        # extrapolation overshoots off-frame near the bottom (perspective).
         for cid in list(self.recent):
             st = self.recent[cid]
             if t_now - st['t'] > WORLD_MERGE_GAP_S:
                 del self.recent[cid]
                 continue
             px, pz = self._extrapolate(st, t_now)
-            if not self._in_road(px, pz):
+            if not self._in_road(px, pz) and not self._near_border_world(*st['pos']):
                 del self.recent[cid]
 
         # Phase 1 — resolve known aliases.
@@ -360,7 +380,7 @@ class WorldMerger:
         return out
 
 
-merger = WorldMerger(H_inv=np.linalg.inv(H), road_poly=road_poly)
+merger = WorldMerger(H_inv=np.linalg.inv(H), road_poly=road_poly, frame_w=w, frame_h=h)
 
 
 def color_for_id(tid):
