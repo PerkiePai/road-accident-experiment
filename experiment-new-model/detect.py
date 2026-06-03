@@ -11,8 +11,8 @@ from boxmot.trackers.deepocsort.deepocsort import DeepOcSort
 from ctrv_filter import CTRVFilter
 
 # ─── Config ────────────────────────────────────────────────────
-INPUT_VIDEO  = os.environ.get("INPUT_VIDEO", "../_in/thai_road_full_cut.mp4")
-OUTPUT_VIDEO = os.environ.get("OUTPUT_VIDEO", "out/thai_road_full_cut_cp4.mp4")
+INPUT_VIDEO  = os.environ.get("INPUT_VIDEO", "../_in/accident_mixed_full.mp4")
+OUTPUT_VIDEO = os.environ.get("OUTPUT_VIDEO", "out/accident_mixed_full_cp4.mp4")
 H_PATH       = "H_manual.npy"
 SRC_PATH     = "src_manual.npy"
 TRACK_PATH   = "track_manual.npy"
@@ -24,10 +24,12 @@ HISTORY_SEC          = 5.0
 TRACE_SEC            = 2.5
 SPEED_WINDOW         = 0.5
 EMA_ALPHA            = 0.1
-PANEL_SIZE           = (340, 200)
+PANEL_HEIGHT_FRAC    = 0.25   # panel height as a fraction of the video frame height
+PANEL_ASPECT         = 1.70   # panel width / height ratio
 PANEL_MARGIN         = 20
 PANEL_VMAX_KMH_FLOOR = 120
 HEADING_ARROW_M      = 3.0    # length (metres) of the drawn CTRV heading arrow
+FAR_GATE_ENABLE      = False   # set False to disable the far-road gate (always reliable)
 FAR_GATE_RATIO       = 8.0    # gate when the local world-scale (m/px) exceeds this
                               # many times the near-field (well-resolved) m/px. A
                               # pure ratio, so it transfers across calibrations of
@@ -35,7 +37,7 @@ FAR_GATE_RATIO       = 8.0    # gate when the local world-scale (m/px) exceeds t
                               # past it the contact point is too near the horizon —
                               # a pixel of jitter maps to a large world step, spiking
                               # BOTH heading and speed, so we hold heading and coast
-                              # speed (raw v still logged).
+                              # speed (raw v still logged).  Ignored when FAR_GATE_ENABLE=False.
 WORLD_MERGE_DIST_M   = 5.0    # Phase 2 cross-frame match radius (metres)
 WORLD_STATIONARY_M   = 2.0   # tighter Phase 2 radius for near-stationary canonicals — a parked
                               # car's continuation is at the same spot, so the loose moving-radius
@@ -86,6 +88,10 @@ w            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 h            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 writer       = cv2.VideoWriter(OUTPUT_VIDEO, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+
+_ph      = int(h * PANEL_HEIGHT_FRAC)
+_pw      = int(_ph * PANEL_ASPECT)
+PANEL_SIZE = (_pw, _ph)
 
 # ─── Detector: RT-DETR-l (no NMS) ─────────────────────────────
 detector = RTDETR("rtdetr-l.pt")
@@ -438,8 +444,11 @@ def _near_field_mpp(poly, n=48):
     return float(np.percentile(vals, 5))   # robust "best resolution" inside ROI
 
 MPP_REF = _near_field_mpp(road_poly)
-print(f"Far-gate: near-field m/px ref = {MPP_REF:.4f}  "
-      f"-> hold above {FAR_GATE_RATIO * MPP_REF:.3f} m/px ({FAR_GATE_RATIO:.0f}x)")
+if FAR_GATE_ENABLE:
+    print(f"Far-gate: ON  near-field m/px ref = {MPP_REF:.4f}  "
+          f"-> hold above {FAR_GATE_RATIO * MPP_REF:.3f} m/px ({FAR_GATE_RATIO:.0f}x)")
+else:
+    print("Far-gate: OFF (all contact points treated as reliable)")
 
 def speed_from_history(hist, window_sec):
     if len(hist) < 2:
@@ -734,7 +743,7 @@ while cap.isOpened():
         # detection jitter maps to a large world step, spiking BOTH speed and
         # heading, so we gate both on the same far-road test — expressed as a
         # ratio to the near-field scale so it is calibration-scale-independent.
-        reliable = local_scale_mpp(gx, gy) <= FAR_GATE_RATIO * MPP_REF
+        reliable = (not FAR_GATE_ENABLE) or (local_scale_mpp(gx, gy) <= FAR_GATE_RATIO * MPP_REF)
 
         # Only update position/speed from a trustworthy contact point.  When the
         # bottom is clipped beyond the reconstruction horizon (conf == 0) we

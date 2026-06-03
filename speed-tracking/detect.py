@@ -7,9 +7,9 @@ import numpy as np
 from ultralytics import YOLO
 
 # ─── Config ────────────────────────────────────────────────────
-INPUT_VIDEO   = "../_in/car_100kmh.mp4"
+INPUT_VIDEO   = "../_in/car_60kmh.mp4"
 model = YOLO("yolo11n.pt")
-OUTPUT_VIDEO  = "out/car_100kmh_tracked.mp4"
+OUTPUT_VIDEO  = "out/car_60kmh_tracked.mp4"
 H_PATH        = "H_manual.npy"
 SRC_PATH      = "src_manual.npy"
 TRACK_PATH    = "track_manual.npy"

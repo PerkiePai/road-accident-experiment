@@ -28,6 +28,10 @@ python detect.py
 ```
 Reads the three `.npy` calibration files and produces an annotated output video.
 
+**Switching videos (`experiment-new-model`).** Calibration is per-camera, so each input video needs its own `H/src/track_manual.npy`. `detect.py` reads `INPUT_VIDEO`/`OUTPUT_VIDEO` and `manual_calibrate.py` reads `CALIB_VIDEO` from the environment (with the in-file defaults as fallback), so you can point them at a clip without editing code. Back up the active `*_manual.npy` before recalibrating for a different camera (e.g. `*_carlong.npy` is the car_long backup). Set `DUMP_TRACE=1` to also write `out/detect_speed_trace.csv` (per-frame per-cid: positions, speed, heading, yaw, recon/clip flags) — used by `cp4_tune.py`/`plot_heading.py`.
+
+**Recovering a lost calibration.** Because `detect_speed_trace.csv` logs both pixel `(gx,gy)` and world `(x_m,z_m)`, the exact homography can be re-fit from those correspondences with `cv2.findHomography(pixels, world)` — useful if an `H_manual.npy` was overwritten while a trace from it survives.
+
 ## Dependencies
 
 - `opencv-python` (`cv2`)
@@ -97,6 +101,17 @@ The alias table is **sticky** — a raw ID's canonical never changes once assign
 
 A **debounced motion gate** (on net displacement over a short window) is the key to stability: a stationary car's position jitter would otherwise be read as continuous turning and wind the heading up by full rotations. The filter declares "moving" only after `N_ON` sustained frames above `V_ON` (rejecting jitter spikes), reverts below `V_OFF`, and while stationary **holds** the last good heading with `ω = 0`. Yaw rate is clamped to `OMEGA_MAX`. Tune in `ctrv_filter.py` (module constants). Offline tuning replays `out/detect_speed_trace.csv` through the filter with no GPU via `cp4_tune.py`.
 
+**Onset handling (no swing at motion start).** When a held (stationary) car first moves, naively trusting the EKF makes it overshoot the true heading (e.g. 0°→125°→settle), reading as a big direction swing. Three things prevent this: (1) the seed heading is taken from the **net-displacement direction**; (2) the heading/yaw **covariance is collapsed** at seed so the EKF trusts the seed instead of chasing the first noisy positions; (3) for `N_WARMUP` frames after onset the filter reports the **geometric net-displacement heading** with yaw pinned to 0, handing off to the EKF only once settled. `has_heading` is False during the brief onset delay before a real heading is seeded — `detect.py` does **not** draw/record the heading until it is True, so a moving car never shows the arbitrary init (0°) as a wrong-way arrow that then snaps ~180°.
+
+### Reliability gates — far-road & occlusion (`detect.py`)
+
+Both speed and heading are only trusted from a sound ground-contact point. Two gates protect them; on either, the heading is **held** and the EMA speed **coasts** (raw `v` is still logged), and the trail/arrow are not drawn.
+
+- **Far-road gate** — near the horizon one pixel of jitter maps to a large world step. The gate is the local world-scale `local_scale_mpp(gx,gy)` (metres per vertical pixel) compared as a **ratio** to the near-field scale: `reliable = local_scale_mpp <= FAR_GATE_RATIO × MPP_REF`, where `MPP_REF` is the 5th-percentile m/px sampled over the tracking polygon at startup. Using a ratio (not an absolute m/px) makes it **calibration-scale-independent** — an absolute threshold silently never fires on a small-metric calibration and over-gates on a large one. Lower `FAR_GATE_RATIO` to gate more of the far field.
+- **Occlusion gate** (`ground_y`) — RT-DETR boxes only the *visible* part of an occluded vehicle, so the box collapses and the bottom-contact point jumps (scattering the tail and corrupting direction). A box height below `OCCLUSION_FACTOR` of the **last few** clean frames (not a long window, so a receding car isn't falsely flagged) is treated as occluded → coast, and the partial height is not added to the box-height history. This complements the frame-border clip reconstruction, which only covers clips at the image edge.
+
+The ground-trail also breaks across time gaps > `TRAIL_GAP_S` (skipped/occluded frames, or a detection gap) instead of drawing a long straight bridge line.
+
 ### Key tuning constants (`experiment-new-model/detect.py`)
 | Constant | Purpose |
 |---|---|
@@ -107,6 +122,9 @@ A **debounced motion gate** (on net displacement over a short window) is the key
 | `WORLD_MERGE_GAP_S` | How long a lost canonical stays a match candidate (seconds) |
 | `PANEL_VMAX_KMH_FLOOR` | Minimum y-axis ceiling on the speed chart |
 | `HEADING_ARROW_M` | Length (metres) of the drawn CTRV heading arrow |
+| `FAR_GATE_RATIO` | Far-road gate: hold heading/coast speed when local m/px exceeds this ×near-field (calibration-scale-free) |
+| `OCCLUSION_FACTOR` | Box-height fraction (vs recent clean frames) below which a vehicle is treated as occluded → coast |
+| `TRAIL_GAP_S` | Break the ground-trail across time gaps bigger than this (no bridge line) |
 
 ### Calibration geometry
 `ManualCalibrator(lane_width_m=7.0, road_depth_m=10.0)` — the destination rectangle for `findHomography` is always `[0,0] – [lane_width_m, road_depth_m]` in metres. Adjust these to match the actual road dimensions you clicked on.

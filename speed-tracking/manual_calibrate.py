@@ -203,7 +203,7 @@ class ManualCalibrator:
 
 
 if __name__ == "__main__":
-    cap = cv2.VideoCapture("../_in/car_100kmh.mp4")
+    cap = cv2.VideoCapture("../_in/car_60kmh.mp4")
 
     calib = ManualCalibrator(lane_width_m=7.0, road_depth_m=10.0)
     H, src = calib.calibrate(cap, save_path="H_manual.npy")
