@@ -9,10 +9,11 @@ import torchvision.transforms as tv_transforms
 from ultralytics import RTDETR
 from boxmot.trackers.deepocsort.deepocsort import DeepOcSort
 from ctrv_filter import CTRVFilter
+from accident_detector import AccidentDetector
 
 # ─── Config ────────────────────────────────────────────────────
 INPUT_VIDEO  = os.environ.get("INPUT_VIDEO", "../_in/accident_mixed_full.mp4")
-OUTPUT_VIDEO = os.environ.get("OUTPUT_VIDEO", "out/accident_mixed_full_cp4.mp4")
+OUTPUT_VIDEO = os.environ.get("OUTPUT_VIDEO", "out/accident_mixed_full_cp5.mp4")
 H_PATH       = os.environ.get("H_PATH",     "H_manual.npy")
 SRC_PATH     = os.environ.get("SRC_PATH",   "src_manual.npy")
 TRACK_PATH   = os.environ.get("TRACK_PATH", "track_manual.npy")
@@ -92,6 +93,9 @@ writer       = cv2.VideoWriter(OUTPUT_VIDEO, cv2.VideoWriter_fourcc(*"mp4v"), fp
 _ph      = int(h * PANEL_HEIGHT_FRAC)
 _pw      = int(_ph * PANEL_ASPECT)
 PANEL_SIZE = (_pw, _ph)
+
+accident_det   = AccidentDetector(fps)
+_accident_rows = []   # (frame, t, cid, speed_kmh, yaw_deg_s, heading_deg)
 
 # ─── Detector: RT-DETR-l (no NMS) ─────────────────────────────
 detector = RTDETR("rtdetr-l.pt")
@@ -778,6 +782,15 @@ while cap.isOpened():
             v = None
         hd = heading.get(cid)
 
+        # ── CP5: accident detection ──────────────────────────────
+        _yaw_now = ctrv_filt[cid].yaw_rate_deg if cid in ctrv_filt else 0.0
+        _spd_now = ema_speed.get(cid) or 0.0
+        is_acc, just_trig, _ = accident_det.update(cid, t_now, _yaw_now, _spd_now)
+        if just_trig:
+            _accident_rows.append((frame_idx, round(t_now, 3), cid,
+                                   round(_spd_now, 1), round(_yaw_now, 1),
+                                   round(hd, 1) if hd is not None else ""))
+
         if os.environ.get("DUMP_TRACE"):
             _cb = int(y2 >= h - EDGE_EPS_PX)
             _cblk = int(x1 <= EDGE_EPS_PX or x2 >= w - EDGE_EPS_PX or y1 <= EDGE_EPS_PX)
@@ -790,20 +803,25 @@ while cap.isOpened():
                                 round(hd, 1) if hd is not None else "",
                                 round(_yaw, 1)))
 
+        # Accident state overrides the track colour to red
+        draw_color   = (0, 0, 255) if is_acc else color
+        bbox_thick   = 3           if is_acc else 2
+
         if recon_conf <= 0 or not reliable:
-            # Far-road or clipped: show the coasted EMA (the raw spike is kept in
-            # the trace CSV, just not displayed or fed into the smoothed speed).
             spd   = ema_speed.get(cid)
             label = (f"id{cid}  {spd:.0f}km/h coast" if spd is not None
                      else f"id{cid}  d={z_m:.1f}m")
         elif v is not None:
             label = f"id{cid}  {v:.0f}km/h  d={z_m:.1f}m"
             if hd is not None:
-                label += f"  {hd:.0f}°"
+                label += f"  {hd:.0f}deg"
             if recon_conf < 1.0:
                 label += f"  rec{recon_conf:.1f}"
         else:
             label = f"id{cid}  d={z_m:.1f}m"
+
+        if is_acc:
+            label = f"[!] ACCIDENT  {label}"
 
         gy_px = int(round(gy))
         gp_trace[cid].append((t_now, gx, gy_px))
@@ -812,15 +830,12 @@ while cap.isOpened():
         if n >= 2:
             for i in range(1, n):
                 alpha     = i / n
-                seg_color = tuple(int(ch * alpha) for ch in color)
+                seg_color = tuple(int(ch * alpha) for ch in draw_color)
                 cv2.line(frame, trail[i-1], trail[i], seg_color, 2, cv2.LINE_AA)
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), draw_color, bbox_thick)
         cv2.circle(frame, (gx, gy_px), 5, (0, 255, 255), -1)
 
-        # Heading arrow: project a point HEADING_ARROW_M ahead in world space and
-        # draw from the contact point, so it follows the road's perspective.
-        # Only for genuinely moving vehicles (heading is held/undefined at rest).
         spd_kmh = ema_speed.get(cid)
         if hd is not None and spd_kmh is not None and spd_kmh > 5.0:
             psi  = np.radians(hd)
@@ -830,7 +845,7 @@ while cap.isOpened():
                             cv2.LINE_AA, tipLength=0.3)
 
         cv2.putText(frame, label, (x1, y1 - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, draw_color, 2, cv2.LINE_AA)
 
     # ── Prune stale state ────────────────────────────────────────
     for tid in list(ema_speed):
@@ -846,6 +861,7 @@ while cap.isOpened():
         if not history[tid] or t_now - history[tid][-1][0] > 2.0:
             ctrv_filt.pop(tid, None)
             heading.pop(tid, None)
+            accident_det.remove(tid)
     for tid in list(heading_history):
         if not history[tid] or t_now - history[tid][-1][0] > 2.0:
             heading_history.pop(tid, None)
@@ -869,6 +885,17 @@ while cap.isOpened():
 cap.release()
 writer.release()
 print(f"\nWrote {OUTPUT_VIDEO} ({frame_idx} frames)")
+
+import csv as _csv
+_acc_path = f"out/{os.path.splitext(os.path.basename(INPUT_VIDEO))[0]}_accidents.csv"
+with open(_acc_path, "w", newline="") as _f:
+    _w = _csv.writer(_f)
+    _w.writerow(["frame", "t", "cid", "speed_kmh", "yaw_deg_s", "heading_deg"])
+    _w.writerows(_accident_rows)
+if _accident_rows:
+    print(f"Wrote {_acc_path} ({len(_accident_rows)} trigger events)")
+else:
+    print(f"No accidents detected — wrote empty {_acc_path}")
 
 if os.environ.get("DUMP_TRACE"):
     import csv as _csv

@@ -104,7 +104,7 @@ def main():
     failed = []
     for i, video in enumerate(files, 1):
         stem         = Path(video).stem
-        output_video = f"out/{stem}_cp4.mp4"
+        output_video = f"out/{stem}_cp5.mp4"
         h_c, src_c, track_c = calib_map[video]
 
         print(f"  [{i}/{len(files)}] {stem} -> {output_video}")
