@@ -13,9 +13,9 @@ from ctrv_filter import CTRVFilter
 # ─── Config ────────────────────────────────────────────────────
 INPUT_VIDEO  = os.environ.get("INPUT_VIDEO", "../_in/accident_mixed_full.mp4")
 OUTPUT_VIDEO = os.environ.get("OUTPUT_VIDEO", "out/accident_mixed_full_cp4.mp4")
-H_PATH       = "H_manual.npy"
-SRC_PATH     = "src_manual.npy"
-TRACK_PATH   = "track_manual.npy"
+H_PATH       = os.environ.get("H_PATH",     "H_manual.npy")
+SRC_PATH     = os.environ.get("SRC_PATH",   "src_manual.npy")
+TRACK_PATH   = os.environ.get("TRACK_PATH", "track_manual.npy")
 
 VEHICLE_CLASSES      = [2, 3, 5, 7]   # car, motorcycle, bus, truck
 CONF                 = 0.40
