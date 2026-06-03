@@ -8,8 +8,13 @@ Three trigger conditions (any one fires):
   2. Sudden stop:   decel > DECEL_ONLY_THRESH  (no yaw required — rear/frontal hits)
   3. Combo:         |yaw_deg_s| > YAW_SPIKE_DEG_S AND decel > DECEL_COMBO_THRESH
 
-Deceleration is computed over a SHORT window (DECEL_WINDOW_S ~ 5 frames) to catch
-the sharp velocity drop at impact, which a longer window averages away.
+EMA initialization guard: in the first MIN_TRACK_FRAMES frames a new track's EMA speed
+hasn't stabilised yet — a noisy first estimate decays toward the true speed, looking like
+deceleration.  For young tracks the decel bar is raised to DECEL_NEW_TRACK_THRESH so only
+a genuinely violent speed drop triggers.
+
+Deceleration is computed over a SHORT window (DECEL_WINDOW_S ~ 5 frames) to catch the
+sharp velocity drop at impact, which a longer window averages away.
 
 Auto-clear (ACCIDENT -> NORMAL):
   |yaw_deg_s| < YAW_CLEAR_DEG_S for CLEAR_FRAMES consecutive frames
@@ -20,13 +25,14 @@ No minimum speed floor — a stationary vehicle hit from behind also shows a yaw
 
 from collections import deque
 
-YAW_SPIKE_DEG_S     = 10.0   # |yaw| above this -> yaw-spike condition
-YAW_CLEAR_DEG_S     =  5.0   # |yaw| below this (hysteresis) -> clearing
-DECEL_ONLY_THRESH   = 50.0   # km/h/s: sudden-stop trigger (no yaw needed)
-DECEL_COMBO_THRESH  = 20.0   # km/h/s: lower bar when combined with a yaw spike
-DECEL_WINDOW_S      =  0.15  # seconds (~5 frames) — short to capture sharp transient
-N_CONFIRM           =  3     # consecutive frames above YAW_SPIKE to confirm yaw trigger
-CLEAR_FRAMES        = 20     # consecutive normal frames required to auto-clear
+YAW_SPIKE_DEG_S      = 15.0   # |yaw| above this -> yaw-spike condition (15 avoids normal turns)
+YAW_CLEAR_DEG_S      =  5.0   # |yaw| below this (hysteresis) -> clearing
+DECEL_ONLY_THRESH    = 55.0   # km/h/s: sudden-stop trigger (raised from 50 to avoid
+                              # borderline EMA-settling false positives)
+DECEL_COMBO_THRESH   = 20.0   # km/h/s: lower bar when combined with a yaw spike
+DECEL_WINDOW_S       =  0.15  # seconds (~5 frames) — short to capture sharp transient
+N_CONFIRM            =  3     # consecutive frames above YAW_SPIKE to confirm yaw trigger
+CLEAR_FRAMES         = 20     # consecutive normal frames required to auto-clear
 
 
 class AccidentDetector:
@@ -44,9 +50,9 @@ class AccidentDetector:
                 'yaw_count':   0,
                 'clear_count': 0,
                 'speed_buf':   deque(maxlen=n),  # (t, speed_kmh)
-                'trigger_t':   None,
-                'trigger_spd': None,
-                'trigger_yaw': None,
+                'trigger_t':    None,
+                'trigger_spd':  None,
+                'trigger_yaw':  None,
             }
         return self._states[cid]
 
@@ -57,10 +63,13 @@ class AccidentDetector:
         """
         st = self._get(cid)
         st['speed_buf'].append((t, speed_kmh))
-
-        buf   = list(st['speed_buf'])
-        dt    = buf[-1][0] - buf[0][0]
-        decel = (-(buf[-1][1] - buf[0][1]) / dt) if dt > 1e-3 else 0.0  # +ve = decelerating
+        buf      = list(st['speed_buf'])
+        buf_full = len(buf) >= st['speed_buf'].maxlen
+        dt       = buf[-1][0] - buf[0][0]
+        # Only compute decel when the buffer is full — a partial buffer (1-2 entries)
+        # computes over just 1-2 frames (0.03-0.07s), amplifying tiny EMA noise into
+        # apparent 60+ km/h/s transients that mimic a crash.
+        decel = (-(buf[-1][1] - buf[0][1]) / dt) if (buf_full and dt > 1e-3) else 0.0
 
         yaw_abs        = abs(yaw_deg_s)
         just_triggered = False
@@ -72,7 +81,6 @@ class AccidentDetector:
             else:
                 st['yaw_count'] = 0
 
-            # Any of three conditions triggers
             yaw_sustained = st['yaw_count'] >= N_CONFIRM
             sudden_stop   = decel > DECEL_ONLY_THRESH
             combo         = yaw_abs > YAW_SPIKE_DEG_S and decel > DECEL_COMBO_THRESH
@@ -85,7 +93,6 @@ class AccidentDetector:
                 st['trigger_yaw'] = yaw_deg_s
                 just_triggered    = True
         else:
-            # Clear: sustained low yaw AND decel below half the sudden-stop threshold
             if yaw_abs < YAW_CLEAR_DEG_S and decel < DECEL_ONLY_THRESH * 0.5:
                 st['clear_count'] += 1
             else:

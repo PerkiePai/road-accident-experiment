@@ -783,13 +783,19 @@ while cap.isOpened():
         hd = heading.get(cid)
 
         # ── CP5: accident detection ──────────────────────────────
+        # Only update when EMA is set — passing 0.0 (unset EMA) into the speed
+        # buffer causes a huge apparent decel on the next real reading (0->70 km/h
+        # in one step), which fires false triggers on every newly-detected track.
         _yaw_now = ctrv_filt[cid].yaw_rate_deg if cid in ctrv_filt else 0.0
-        _spd_now = ema_speed.get(cid) or 0.0
-        is_acc, just_trig, _ = accident_det.update(cid, t_now, _yaw_now, _spd_now)
-        if just_trig:
-            _accident_rows.append((frame_idx, round(t_now, 3), cid,
-                                   round(_spd_now, 1), round(_yaw_now, 1),
-                                   round(hd, 1) if hd is not None else ""))
+        _spd_now = ema_speed.get(cid)
+        if _spd_now is not None:
+            is_acc, just_trig, _ = accident_det.update(cid, t_now, _yaw_now, _spd_now)
+            if just_trig:
+                _accident_rows.append((frame_idx, round(t_now, 3), cid,
+                                       round(_spd_now, 1), round(_yaw_now, 1),
+                                       round(hd, 1) if hd is not None else ""))
+        else:
+            is_acc = accident_det.is_accident(cid)
 
         if os.environ.get("DUMP_TRACE"):
             _cb = int(y2 >= h - EDGE_EPS_PX)
