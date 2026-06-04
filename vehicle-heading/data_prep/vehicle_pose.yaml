@@ -1,0 +1,8 @@
+# SKoPe3D-derived 4-keypoint vehicle pose
+path: D:\intern\NT\project\road-accident\vehicle-heading\datasets\skope3d_yolo
+train: images/train
+val: images/val
+kpt_shape: [4, 3]
+flip_idx: [0, 1, 3, 2]
+names:
+  0: vehicle

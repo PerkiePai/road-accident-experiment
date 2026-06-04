@@ -1,0 +1,4 @@
+# SKoPe3D + derived datasets (large, do not commit)
+datasets/
+runs/
+*.avi
