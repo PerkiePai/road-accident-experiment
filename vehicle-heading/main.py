@@ -9,7 +9,7 @@ Runs a two-source heading pipeline:
 Draws on each tracked vehicle:
   - coloured bounding box (colour = track ID)
   - heading arrow (yellow = pose dominant, cyan = trajectory dominant, grey = hold)
-  - label: ID, speed km/h, heading °, source tag
+  - label: ID, speed km/h, heading deg, source tag
 
 Usage (run from vehicle-heading/):
     conda activate car-detection
@@ -229,10 +229,9 @@ def run(args):
                     arrow_col = src_colour(hsrc)
                     if hsrc not in ("hold", "reject"):
                         draw_arrow(frame, geo, gx, gz, hdeg, ARROW_M, arrow_col, 2)
-
-                    label = f"ID{tid} {spd:.0f}km/h {hdeg:.0f}° [{hsrc[0].upper()}]"
+                    label = f"ID{tid} {spd:.0f}km/h {hdeg:.0f}deg [{hsrc[0].upper()}]"
                 else:
-                    label = f"ID{tid} {spd:.0f}km/h"
+                    label = f"ID{tid} {spd:.0f}km/h --deg"
 
                 # label above box
                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
