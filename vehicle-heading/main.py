@@ -240,14 +240,33 @@ def run(args):
                 cv2.putText(frame, label, (lx + 1, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                             (0, 0, 0), 1, cv2.LINE_AA)
 
-                # keypoint dots (debug)
+                # keypoint overlay
                 if use_pose and args.show_kpts:
                     pd = best_pose_for_box(x1, y1, x2, y2)
                     if pd is not None:
-                        kp_cols = [(0,0,255),(255,0,0),(0,255,0),(0,255,255)]
+                        kp_cols  = [(0,0,255),(255,0,0),(0,255,0),(0,255,255)]
+                        kp_names = ["FC","RC","FL","FR"]
+                        vis = [pd["kpt_conf"][ki] >= KP_CONF_MIN for ki in range(4)]
+                        # front-center -> rear-center spine line
+                        if vis[0] and vis[1]:
+                            fc = (int(pd["kpts"][0][0]), int(pd["kpts"][0][1]))
+                            rc = (int(pd["kpts"][1][0]), int(pd["kpts"][1][1]))
+                            cv2.line(frame, fc, rc, (255, 255, 255), 2)
+                        # front-left -> front-right axle line
+                        if vis[2] and vis[3]:
+                            fl = (int(pd["kpts"][2][0]), int(pd["kpts"][2][1]))
+                            fr = (int(pd["kpts"][3][0]), int(pd["kpts"][3][1]))
+                            cv2.line(frame, fl, fr, (200, 200, 200), 1)
+                        # dots + labels
                         for ki, (kx, ky) in enumerate(pd["kpts"]):
-                            if pd["kpt_conf"][ki] >= KP_CONF_MIN:
-                                cv2.circle(frame, (int(kx), int(ky)), 3, kp_cols[ki], -1)
+                            if not vis[ki]:
+                                continue
+                            pt = (int(kx), int(ky))
+                            cv2.circle(frame, pt, 6, kp_cols[ki], -1)
+                            cv2.circle(frame, pt, 6, (255,255,255), 1)
+                            cv2.putText(frame, kp_names[ki], (pt[0]+7, pt[1]-4),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                        kp_cols[ki], 1, cv2.LINE_AA)
 
         # prune dead tracks
         for tid in list(fusion._state):
