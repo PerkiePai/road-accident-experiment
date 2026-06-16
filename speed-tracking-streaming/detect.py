@@ -1,0 +1,937 @@
+import os
+import re
+import csv as _csv
+import colorsys
+from collections import deque, defaultdict
+from datetime import datetime as _dt, timedelta as _td
+import cv2
+import numpy as np
+import torch
+import torchvision.models as tv_models
+import torchvision.transforms as tv_transforms
+from ultralytics import RTDETR
+from boxmot.trackers.deepocsort.deepocsort import DeepOcSort
+from ctrv_filter import CTRVFilter
+
+# ─── Config ────────────────────────────────────────────────────
+INPUT_VIDEO  = os.environ.get("INPUT_VIDEO", "../_in/video/batch5_0904-0934/cam7_2026-06-12_0904-0934.mp4")
+OUTPUT_VIDEO = os.environ.get("OUTPUT_VIDEO", "out/cam7_2026-06-12_0904-0934_out.mp4")
+H_PATH       = os.environ.get("H_PATH",     "H_manual.npy")
+SRC_PATH     = os.environ.get("SRC_PATH",   "src_manual.npy")
+TRACK_PATH   = os.environ.get("TRACK_PATH", "track_manual.npy")
+
+# Wall-clock timestamp — parse YYYY-MM-DD_HHMM from the video filename
+_m = re.search(r'(\d{4}-\d{2}-\d{2})_(\d{2})(\d{2})', INPUT_VIDEO)
+_VID_START = (_dt.strptime(f"{_m.group(1)} {_m.group(2)}:{_m.group(3)}:00",
+                            "%Y-%m-%d %H:%M:%S") if _m else None)
+def _wall(t_s):
+    if _VID_START:
+        return (_VID_START + _td(seconds=t_s)).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    return f"{t_s:.3f}"
+
+VEHICLE_CLASSES      = [2, 3, 5, 7]   # car, motorcycle, bus, truck
+CONF                 = 0.40
+IOU                  = 0.40
+HISTORY_SEC          = 5.0
+TRACE_SEC            = 2.5
+SPEED_WINDOW         = 0.5
+EMA_ALPHA            = 0.1
+PANEL_HEIGHT_FRAC    = 0.25   # panel height as a fraction of the video frame height
+PANEL_ASPECT         = 1.70   # panel width / height ratio
+PANEL_MARGIN         = 20
+PANEL_VMAX_KMH_FLOOR = 120
+HEADING_ARROW_M      = 3.0    # length (metres) of the drawn CTRV heading arrow
+FAR_GATE_ENABLE      = False   # set False to disable the far-road gate (always reliable)
+FAR_GATE_RATIO       = 8.0    # gate when the local world-scale (m/px) exceeds this
+                              # many times the near-field (well-resolved) m/px. A
+                              # pure ratio, so it transfers across calibrations of
+                              # any metric scale (unlike an absolute m/px threshold):
+                              # past it the contact point is too near the horizon —
+                              # a pixel of jitter maps to a large world step, spiking
+                              # BOTH heading and speed, so we hold heading and coast
+                              # speed (raw v still logged).  Ignored when FAR_GATE_ENABLE=False.
+WORLD_MERGE_DIST_M   = 5.0    # Phase 2 cross-frame match radius (metres)
+WORLD_STATIONARY_M   = 2.0   # tighter Phase 2 radius for near-stationary canonicals — a parked
+                              # car's continuation is at the same spot, so the loose moving-radius
+                              # must not let it absorb a passing vehicle (causes teleport speed spikes)
+WORLD_STATIONARY_VEL = 1.0   # m/s below which a canonical counts as stationary (also gates direction)
+WORLD_MAX_MERGE_VEL  = 50.0  # m/s (180 km/h) hard ceiling — reject a cross-frame merge that would
+                              # require the object to teleport faster than any road vehicle. Robust
+                              # to a canonical's own corrupted velocity estimate (jittery edge boxes).
+WORLD_SAME_FRAME_M   = 1.5   # Phase 3 same-frame merge radius — much tighter to avoid merging adjacent-lane vehicles
+WORLD_MERGE_GAP_S    = 1.5   # how long a lost canonical stays a match candidate
+
+# Bottom reconstruction for cars exiting the frame.  When the box bottom clips
+# the frame border the tyre-contact point is unobservable, so we reconstruct it
+# as y2 = y1 + extrapolated box-height (linear-in-time fit, validated as the
+# best of hold/lin/invlin in validate_reconstruct.py).  Confidence decays over
+# the horizon; beyond it the speed coasts instead of dipping.
+EDGE_EPS_PX          = 3      # box edge within this many px of the border = clipped
+EXIT_MARGIN_PX       = 60     # within this of a border = "exiting scene", keep an on-road track
+RECON_HIST           = 10     # clean box-height samples kept per track
+RECON_FIT_L          = 8      # samples used in the linear height fit
+RECON_MIN_HIST       = 5      # need at least this many clean samples to reconstruct
+RECON_MAX_HORIZON    = 6      # max consecutive clipped frames to keep reconstructing
+RECON_GAP_RESET_S    = 1.0    # reset a track's box history after a gap (tracker id reuse)
+
+# ─── Calibration ───────────────────────────────────────────────
+for p in (H_PATH, SRC_PATH, TRACK_PATH):
+    if not os.path.exists(p):
+        raise SystemExit(
+            f"Missing calibration file: {p}\n"
+            f"Run `python manual_calibrate.py` first."
+        )
+
+H         = np.load(H_PATH)
+H_inv     = np.linalg.inv(H)
+src_rect  = np.load(SRC_PATH).astype(np.int32)
+road_poly = np.load(TRACK_PATH).astype(np.int32)
+
+# ─── Video I/O ─────────────────────────────────────────────────
+os.makedirs("out", exist_ok=True)
+if os.path.exists(OUTPUT_VIDEO):
+    try:
+        os.remove(OUTPUT_VIDEO)
+    except PermissionError:
+        raise SystemExit(f"Output file is locked by another process: {OUTPUT_VIDEO}\nClose any media player or other process using it and try again.")
+cap = cv2.VideoCapture(INPUT_VIDEO)
+if not cap.isOpened():
+    raise SystemExit(f"Cannot open {INPUT_VIDEO}")
+
+fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
+w            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+h            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+writer       = cv2.VideoWriter(OUTPUT_VIDEO, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+
+_ph      = int(h * PANEL_HEIGHT_FRAC)
+_pw      = int(_ph * PANEL_ASPECT)
+PANEL_SIZE = (_pw, _ph)
+
+# ─── Detector: RT-DETR-l (no NMS) ─────────────────────────────
+detector = RTDETR("rtdetr-l.pt")
+
+# ─── Tracker: Deep OC-SORT ─────────────────────────────────────
+# Q_xy_scaling raised from default 0.01 → 0.08 for fast-moving vehicles.
+# We supply ResNet-18 embeddings externally via embs= so reid_model=None.
+tracker = DeepOcSort(
+    reid_model=None,
+    embedding_off=False,
+    w_association_emb=0.2,   # autotune best: rely heavily on position
+    Q_xy_scaling=0.08,
+    Q_s_scaling=0.0004,
+    delta_t=3,
+    inertia=0.2,
+    min_hits=1,
+    max_age=60,
+)
+
+# ─── Feature extractor: ResNet-18 ──────────────────────────────
+_feat_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+_feat_model  = tv_models.resnet18(weights=tv_models.ResNet18_Weights.DEFAULT)
+_feat_model.fc = torch.nn.Identity()
+_feat_model.eval().to(_feat_device)
+
+_feat_tf = tv_transforms.Compose([
+    tv_transforms.ToPILImage(),
+    tv_transforms.Resize((128, 64)),
+    tv_transforms.ToTensor(),
+    tv_transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]),
+])
+
+def extract_features(frame_bgr, boxes_xyxy):
+    if not boxes_xyxy:
+        return np.empty((0, 512), dtype=np.float32)
+    fh, fw = frame_bgr.shape[:2]
+    rgb    = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    crops  = []
+    for x1, y1, x2, y2 in boxes_xyxy:
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(fw, int(x2)), min(fh, int(y2))
+        if x2 <= x1 or y2 <= y1:
+            crops.append(torch.zeros(3, 128, 64))
+        else:
+            crops.append(_feat_tf(rgb[y1:y2, x1:x2]))
+    batch = torch.stack(crops).to(_feat_device)
+    with torch.no_grad():
+        feats = _feat_model(batch).cpu().numpy()
+    norms = np.linalg.norm(feats, axis=1, keepdims=True)
+    return feats / np.where(norms < 1e-6, 1.0, norms)
+
+# ─── State ─────────────────────────────────────────────────────
+history      = defaultdict(lambda: deque(maxlen=int(fps * HISTORY_SEC)))
+ema_speed    = {}
+speed_history = defaultdict(lambda: deque(maxlen=int(fps * HISTORY_SEC)))
+gp_trace     = defaultdict(lambda: deque(maxlen=int(fps * TRACE_SEC) + 1))
+
+# CTRV heading filter, keyed by CANONICAL id (runs on WorldMerger-stabilised
+# tracks so the heading state isn't fragmented by tracker ID switches).
+ctrv_filt    = {}   # cid -> CTRVFilter
+heading      = {}   # cid -> last heading (deg);  yaw_rate via the filter
+heading_history = defaultdict(lambda: deque(maxlen=int(fps * HISTORY_SEC)))
+
+# Bottom-reconstruction state, keyed by RAW tracker id (box geometry is a
+# property of the raw track, and we reconstruct before WorldMerger remaps ids).
+box_hist     = defaultdict(lambda: deque(maxlen=RECON_HIST))  # tid -> deque[(t, hbox)]
+box_seen_t   = {}                                             # tid -> last t seen
+clip_age     = defaultdict(int)                               # tid -> consecutive clipped frames
+was_on_road  = {}                                             # tid -> last clean on-road status
+
+# CSV logging state
+_first_seen  = {}   # cid -> (frame_idx, t_now)
+_last_seen   = {}   # cid -> (frame_idx, t_now)
+_speed_rows  = []   # (frame, time_s, wall_time, car_id, speed_kmh)
+_pos_rows    = []   # (frame, time_s, wall_time, car_id, x_m, z_m)
+
+# ─── Helpers ───────────────────────────────────────────────────
+def nms_tracks(tracks, iou_thresh=0.50):
+    """Post-tracking NMS: if two track boxes overlap > iou_thresh, drop the
+    one with lower confidence so the same vehicle doesn't get two drawn IDs."""
+    if len(tracks) == 0:
+        return tracks
+    boxes = tracks[:, :4]
+    scores = tracks[:, 5]
+    order = scores.argsort()[::-1]
+    keep = []
+    suppressed = set()
+    for i in range(len(order)):
+        idx = order[i]
+        if idx in suppressed:
+            continue
+        keep.append(idx)
+        x1a, y1a, x2a, y2a = boxes[idx]
+        for j in range(i + 1, len(order)):
+            jdx = order[j]
+            if jdx in suppressed:
+                continue
+            x1b, y1b, x2b, y2b = boxes[jdx]
+            ix1, iy1 = max(x1a, x1b), max(y1a, y1b)
+            ix2, iy2 = min(x2a, x2b), min(y2a, y2b)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            area_a = (x2a - x1a) * (y2a - y1a)
+            area_b = (x2b - x1b) * (y2b - y1b)
+            union = area_a + area_b - inter
+            if union > 0 and inter / union > iou_thresh:
+                suppressed.add(jdx)
+    return tracks[sorted(keep)]
+
+class WorldMerger:
+    """Stable world-coordinate ID layer.
+
+    Two operating modes every frame:
+    1. Cross-frame: a new raw ID whose ground position falls within
+       WORLD_MERGE_DIST_M of a recently-lost canonical (extrapolated forward)
+       is aliased to that canonical.  This catches the alternating-track case
+       where the two IDs never appear in the same frame simultaneously.
+    2. Same-frame: two simultaneously-active canonicals within
+       WORLD_MERGE_DIST_M are merged (older absorbs newer).
+
+    Alias table is sticky — once assigned, a raw ID never changes canonical.
+
+    H_inv + road_poly are used to prune candidates whose extrapolated
+    ground position has left the tracking zone, preventing a departing
+    vehicle's canonical from being stolen by the next vehicle behind it.
+    """
+
+    def __init__(self, H_inv=None, road_poly=None, frame_w=None, frame_h=None):
+        self.alias           = {}   # raw_tid -> canonical_tid
+        self.alias_last_seen = {}   # raw_tid -> t_now when last active
+        self.first_seen      = {}   # canonical_tid -> frame_idx
+        # canonical_tid -> {'t': float, 'pos': (x,z), 'vel': (vx,vz)}
+        self.recent          = {}
+        self._H_inv          = H_inv
+        self._road_poly      = road_poly
+        self._fw             = frame_w
+        self._fh             = frame_h
+
+    def _extrapolate(self, state, t_now):
+        dt = t_now - state['t']
+        return (state['pos'][0] + state['vel'][0] * dt,
+                state['pos'][1] + state['vel'][1] * dt)
+
+    def _in_road(self, x_m, z_m):
+        """Return True if world point (x_m, z_m) projects inside road_poly."""
+        if self._H_inv is None or self._road_poly is None:
+            return True
+        px = cv2.perspectiveTransform(
+            np.array([[[x_m, z_m]]], dtype=np.float32), self._H_inv
+        )[0, 0]
+        return cv2.pointPolygonTest(
+            self._road_poly, (float(px[0]), float(px[1])), False
+        ) >= 0
+
+    def _near_border_world(self, x_m, z_m):
+        """True if world point projects within EXIT_MARGIN_PX of a frame border
+        (or off-frame) — i.e. the canonical is exiting the scene."""
+        if self._H_inv is None or self._fw is None:
+            return False
+        px = cv2.perspectiveTransform(
+            np.array([[[x_m, z_m]]], dtype=np.float32), self._H_inv
+        )[0, 0]
+        x, y = float(px[0]), float(px[1])
+        m = EXIT_MARGIN_PX
+        return x <= m or y <= m or x >= self._fw - m or y >= self._fh - m
+
+    def _update_vel(self, cid, t, x, z):
+        prev = self.recent.get(cid)
+        if prev and (t - prev['t']) > 1e-3:
+            dt = t - prev['t']
+            vx = 0.5 * prev['vel'][0] + 0.5 * (x - prev['pos'][0]) / dt
+            vz = 0.5 * prev['vel'][1] + 0.5 * (z - prev['pos'][1]) / dt
+        else:
+            vx, vz = prev['vel'] if prev else (0.0, 0.0)
+        self.recent[cid] = {'t': t, 'pos': (x, z), 'vel': (vx, vz)}
+
+    def update(self, t_now, frame_idx, tid_pos_list):
+        """
+        tid_pos_list: [(tid, x_m, z_m), ...]
+        Returns: {tid: canonical_tid}
+        """
+        # Prune: stale by time, or extrapolated position has left the road —
+        # EXCEPT keep a canonical that is exiting via a frame border, so its own
+        # re-detected track can re-attach (otherwise the car gets a fresh id,
+        # e.g. id4->id10 after it passed the ROI's bottom edge). Theft by a
+        # following vehicle is still blocked by the distance/direction/teleport
+        # gates. Border test uses the LAST OBSERVED position because the
+        # extrapolation overshoots off-frame near the bottom (perspective).
+        for cid in list(self.recent):
+            st = self.recent[cid]
+            if t_now - st['t'] > WORLD_MERGE_GAP_S:
+                del self.recent[cid]
+                continue
+            px, pz = self._extrapolate(st, t_now)
+            if not self._in_road(px, pz) and not self._near_border_world(*st['pos']):
+                del self.recent[cid]
+
+        # Phase 1 — resolve known aliases.
+        # An alias is valid only if:
+        #   (a) the raw ID was seen recently (time-based expiry catches tracker
+        #       ID reuse after a long absence), AND
+        #   (b) the canonical is still in `recent` (it hasn't been pruned for
+        #       leaving the road — catches the case where the tracker reuses a
+        #       departed vehicle's raw ID for the very next vehicle).
+        frame_tracks = []   # (tid, canonical, x_m, z_m)
+        new_raw      = []   # (tid, x_m, z_m) — treat as unknown this frame
+        for tid, x_m, z_m in tid_pos_list:
+            if tid in self.alias:
+                can         = self.alias[tid]
+                last_seen   = self.alias_last_seen.get(tid, 0)
+                still_fresh = t_now - last_seen <= WORLD_MERGE_GAP_S
+                still_active = can in self.recent
+
+                # Direction gate in Phase 1: if the detection is significantly
+                # *behind* the canonical's extrapolated trajectory, it's a
+                # different vehicle (e.g. tracker reused the departing vehicle's
+                # raw ID for the next vehicle following it).
+                behind = False
+                if still_fresh and still_active:
+                    state     = self.recent[can]
+                    px, pz    = self._extrapolate(state, t_now)
+                    vel_speed = float(np.hypot(*state['vel']))
+                    if vel_speed > 1.0:
+                        dot = ((x_m - px) * state['vel'][0] +
+                               (z_m - pz) * state['vel'][1]) / vel_speed
+                        if dot < -WORLD_MERGE_DIST_M:
+                            behind = True
+
+                if still_fresh and still_active and not behind:
+                    self.alias_last_seen[tid] = t_now
+                    frame_tracks.append((tid, can, x_m, z_m))
+                else:
+                    del self.alias[tid]
+                    new_raw.append((tid, x_m, z_m))
+            else:
+                new_raw.append((tid, x_m, z_m))
+
+        # Phase 2 — cross-frame match: new raw IDs vs recently-lost canonicals
+        active_cids = {can for _, can, _, _ in frame_tracks}
+        used        = set()
+        for tid, x_m, z_m in new_raw:
+            best_cid, best_dist = None, float('inf')
+            for cid, state in self.recent.items():
+                if cid in active_cids or cid in used:
+                    continue
+                px, pz = self._extrapolate(state, t_now)
+                dist   = float(np.hypot(x_m - px, z_m - pz))
+                vel_speed = float(np.hypot(*state['vel']))
+                dot = None
+                if vel_speed > WORLD_STATIONARY_VEL:
+                    dot = ((x_m - px) * state['vel'][0] +
+                           (z_m - pz) * state['vel'][1]) / vel_speed
+                # Physical-plausibility gate: reject a match that would require the
+                # object to teleport from its last actual position faster than any
+                # road vehicle.  Robust even when this canonical's velocity estimate
+                # is corrupted (e.g. a jittery edge box flicking between positions).
+                dt_cand  = t_now - state['t']
+                dist_raw = float(np.hypot(x_m - state['pos'][0], z_m - state['pos'][1]))
+                if dt_cand > 1e-3 and dist_raw > WORLD_MAX_MERGE_VEL * dt_cand:
+                    continue
+                # A stationary canonical has no extrapolation slack, so it must
+                # not reach across the loose moving-radius to grab a passer-by.
+                radius = WORLD_MERGE_DIST_M if vel_speed > WORLD_STATIONARY_VEL else WORLD_STATIONARY_M
+                if dist >= radius or dist >= best_dist:
+                    continue
+                if dot is not None and dot < -WORLD_MERGE_DIST_M:
+                    continue
+                best_cid, best_dist = cid, dist
+            if best_cid is not None:
+                used.add(best_cid)
+                self.alias[tid] = best_cid
+                self.alias_last_seen[tid] = t_now
+                frame_tracks.append((tid, best_cid, x_m, z_m))
+                active_cids.add(best_cid)
+            else:
+                self.alias[tid] = tid
+                self.alias_last_seen[tid] = t_now
+                self.first_seen.setdefault(tid, frame_idx)
+                frame_tracks.append((tid, tid, x_m, z_m))
+                active_cids.add(tid)
+
+        # Phase 3 — same-frame merge
+        seen_can = {}
+        for _, can, x_m, z_m in frame_tracks:
+            seen_can.setdefault(can, (x_m, z_m))
+
+        redirect = {}
+        can_list = list(seen_can.items())
+        for i in range(len(can_list)):
+            can_i, (xi, zi) = can_list[i]
+            root_i = redirect.get(can_i, can_i)
+            for j in range(i + 1, len(can_list)):
+                can_j, (xj, zj) = can_list[j]
+                root_j = redirect.get(can_j, can_j)
+                if root_i == root_j:
+                    continue
+                if np.hypot(xi - xj, zi - zj) < WORLD_SAME_FRAME_M:
+                    senior = root_i if self.first_seen.get(root_i, 0) <= self.first_seen.get(root_j, 0) else root_j
+                    junior = root_j if senior == root_i else root_i
+                    redirect[junior] = senior
+                    self.first_seen.pop(junior, None)
+
+        # Apply redirects through alias table
+        for k in list(self.alias):
+            c = self.alias[k]
+            if c in redirect:
+                self.alias[k] = redirect[c]
+
+        out = {}
+        for tid, can, x_m, z_m in frame_tracks:
+            final = redirect.get(can, can)
+            self.alias[tid] = final
+            self._update_vel(final, t_now, x_m, z_m)
+            out[tid] = final
+        return out
+
+
+merger = WorldMerger(H_inv=H_inv, road_poly=road_poly, frame_w=w, frame_h=h)
+
+
+def color_for_id(tid):
+    h_ = (int(tid) * 0.61803398875) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(h_, 0.85, 1.0)
+    return int(b * 255), int(g * 255), int(r * 255)
+
+def project_to_ground(px, py):
+    pt = np.array([[[px, py]]], dtype=np.float32)
+    xz = cv2.perspectiveTransform(pt, H)[0, 0]
+    return float(xz[0]), float(xz[1])
+
+def ground_to_px(x_m, z_m):
+    pt = np.array([[[x_m, z_m]]], dtype=np.float32)
+    px = cv2.perspectiveTransform(pt, H_inv)[0, 0]
+    return int(round(px[0])), int(round(px[1]))
+
+def local_scale_mpp(gx, gy):
+    """Metres of world distance per vertical pixel at this contact point.
+    Grows sharply toward the horizon — a robust, camera-independent proxy for
+    how much a 1px detection jitter corrupts the ground position (and heading)."""
+    a = project_to_ground(gx, gy)
+    b = project_to_ground(gx, gy - 1)
+    return float(np.hypot(b[0] - a[0], b[1] - a[1]))
+
+def _near_field_mpp(poly, n=48):
+    """Reference world-scale: the m/px of the best-resolved (near) ground inside
+    the tracking region. Used to make the far-gate a pure ratio, so it means the
+    same thing on any calibration regardless of its assigned metric scale."""
+    xs, ys = poly[:, 0], poly[:, 1]
+    vals = []
+    for gx in np.linspace(xs.min(), xs.max(), n):
+        for gy in np.linspace(ys.min(), ys.max(), n):
+            if cv2.pointPolygonTest(poly, (float(gx), float(gy)), False) >= 0:
+                vals.append(local_scale_mpp(gx, gy))
+    if not vals:
+        return 1e-9
+    return float(np.percentile(vals, 5))   # robust "best resolution" inside ROI
+
+MPP_REF = _near_field_mpp(road_poly)
+if FAR_GATE_ENABLE:
+    print(f"Far-gate: ON  near-field m/px ref = {MPP_REF:.4f}  "
+          f"-> hold above {FAR_GATE_RATIO * MPP_REF:.3f} m/px ({FAR_GATE_RATIO:.0f}x)")
+else:
+    print("Far-gate: OFF (all contact points treated as reliable)")
+
+def speed_from_history(hist, window_sec):
+    if len(hist) < 2:
+        return None
+    t_now, x_now, z_now = hist[-1]
+    t_old, x_old, z_old = hist[0]
+    for entry in hist:
+        if t_now - entry[0] <= window_sec:
+            t_old, x_old, z_old = entry
+            break
+    dt = t_now - t_old
+    if dt < 1e-3:
+        return None
+    return np.hypot(x_now - x_old, z_now - z_old) / dt * 3.6
+
+def ground_y(tid, t_now, y1, y2, clip_bottom, clip_block):
+    """Decide the tyre-contact y for one raw track and report confidence.
+
+    Maintains a per-track history of clean (unclipped) box heights.  When the
+    bottom is clipped, reconstruct y2 = y1 + linear-extrapolated box height.
+
+    clip_block: side or top is clipped — y1 and/or the box height are corrupted,
+                so reconstruction is not attempted.
+
+    Returns (gy, conf).  conf in [0, 1]; conf == 0 means no trustworthy contact
+    point (caller should coast rather than measure).
+    """
+    # Reset history if the tracker reused this id after a gap (different vehicle).
+    last = box_seen_t.get(tid)
+    if last is not None and t_now - last > RECON_GAP_RESET_S:
+        box_hist[tid].clear()
+        clip_age[tid] = 0
+        was_on_road.pop(tid, None)
+    box_seen_t[tid] = t_now
+
+    hbox = y2 - y1
+    if not clip_bottom and not clip_block:
+        box_hist[tid].append((t_now, hbox))   # clean observation
+        clip_age[tid] = 0
+        return float(y2), 1.0
+
+    clip_age[tid] += 1
+    if clip_block:
+        return float(y2), 0.0                  # side/top clipped — cannot reconstruct
+
+    hist = list(box_hist[tid])
+    if len(hist) < RECON_MIN_HIST or clip_age[tid] > RECON_MAX_HORIZON:
+        return float(y2), 0.0                  # too little history, or past horizon
+
+    ts = np.array([p[0] for p in hist[-RECON_FIT_L:]])
+    hs = np.array([p[1] for p in hist[-RECON_FIT_L:]])
+    b, a = np.polyfit(ts, hs, 1)
+    hbox_pred = a + b * t_now
+    if hbox_pred <= 0:
+        return float(y2), 0.0
+    y2_recon = y1 + hbox_pred
+    conf = max(0.0, 1.0 - (clip_age[tid] - 1) / RECON_MAX_HORIZON)
+    return float(y2_recon), conf
+
+def draw_road_overlay(frame, poly):
+    ov = frame.copy()
+    cv2.fillPoly(ov, [poly], (255, 200, 0))
+    cv2.addWeighted(ov, 0.18, frame, 0.82, 0, frame)
+    cv2.polylines(frame, [poly], True, (255, 220, 0), 2)
+
+
+def draw_speed_panel(frame, speed_history, ema_speed, t_now, frame_w, frame_h):
+    pw, ph = PANEL_SIZE
+    x0 = frame_w - pw - PANEL_MARGIN
+    y0 = frame_h - ph - PANEL_MARGIN
+    x1, y1 = x0 + pw, y0 + ph
+
+    ov = frame.copy()
+    cv2.rectangle(ov, (x0, y0), (x1, y1), (20, 20, 20), -1)
+    cv2.addWeighted(ov, 0.65, frame, 0.35, 0, frame)
+    cv2.rectangle(frame, (x0, y0), (x1, y1), (200, 200, 200), 1)
+
+    pad_l, pad_r, pad_t, pad_b = 38, 8, 22, 18
+    px0, py0 = x0 + pad_l, y0 + pad_t
+    px1, py1 = x1 - pad_r, y1 - pad_b
+    plot_w, plot_h = px1 - px0, py1 - py0
+
+    vmax = PANEL_VMAX_KMH_FLOOR
+    if ema_speed:
+        vmax = max(vmax, max(ema_speed.values()) * 1.2)
+
+    cv2.putText(frame, "km/h", (x0 + 4, y0 + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+    for i in range(5):
+        v  = vmax * i / 4
+        yy = py1 - int(plot_h * i / 4)
+        cv2.line(frame, (px0, yy), (px1, yy), (70, 70, 70), 1)
+        cv2.putText(frame, f"{int(v)}", (x0 + 6, yy + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+
+    cv2.putText(frame, f"-{HISTORY_SEC:.0f}s", (px0, py1 + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(frame, "0", (px1 - 8, py1 + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+
+    active_ids = []
+    for tid, sh in speed_history.items():
+        if len(sh) < 2 or t_now - sh[-1][0] > 1.0:
+            continue
+        pts = []
+        for t, v in sh:
+            age = t_now - t
+            if age > HISTORY_SEC:
+                continue
+            fx = px1 - int(plot_w * (age / HISTORY_SEC))
+            fy = py1 - int(plot_h * min(v / vmax, 1.0))
+            pts.append((fx, fy))
+        if len(pts) >= 2:
+            cv2.polylines(frame, [np.array(pts, dtype=np.int32)],
+                          False, color_for_id(tid), 2, cv2.LINE_AA)
+            active_ids.append(tid)
+
+    lx = x0 + 50
+    for tid in active_ids[:5]:
+        cv2.rectangle(frame, (lx, y0 + 6), (lx + 10, y0 + 14), color_for_id(tid), -1)
+        cv2.putText(frame, f"id{tid}", (lx + 14, y0 + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (220, 220, 220), 1, cv2.LINE_AA)
+        lx += 50
+    if len(active_ids) > 5:
+        cv2.putText(frame, f"+{len(active_ids)-5}", (lx, y0 + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (220, 220, 220), 1, cv2.LINE_AA)
+
+
+def draw_direction_panel(frame, heading_history, t_now, frame_w, frame_h):
+    """Bottom-left companion to the speed panel: per-track TURN RATE (rate of
+    direction change, deg/s) vs time over the last HISTORY_SEC.  Centred on a
+    zero line — straight driving runs flat along it, a turn or collision
+    deflects up/down.  Y-axis is symmetric and auto-scaled."""
+    pw, ph = PANEL_SIZE
+    x0 = PANEL_MARGIN
+    y0 = frame_h - ph - PANEL_MARGIN
+    x1, y1 = x0 + pw, y0 + ph
+
+    ov = frame.copy()
+    cv2.rectangle(ov, (x0, y0), (x1, y1), (20, 20, 20), -1)
+    cv2.addWeighted(ov, 0.65, frame, 0.35, 0, frame)
+    cv2.rectangle(frame, (x0, y0), (x1, y1), (200, 200, 200), 1)
+
+    pad_l, pad_r, pad_t, pad_b = 40, 8, 22, 18
+    px0, py0 = x0 + pad_l, y0 + pad_t
+    px1, py1 = x1 - pad_r, y1 - pad_b
+    plot_w, plot_h = px1 - px0, py1 - py0
+    pyc = py0 + plot_h // 2                     # zero (centre) line
+
+    # Auto-scale symmetric range from the data, floored so noise isn't amplified.
+    vmax = 30.0
+    for hh in heading_history.values():
+        for t, yaw in hh:
+            if t_now - t <= HISTORY_SEC:
+                vmax = max(vmax, abs(yaw))
+    vmax *= 1.1
+
+    cv2.putText(frame, "turn deg/s", (x0 + 4, y0 + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+    for i in range(-2, 3):                      # gridlines at -vmax..+vmax
+        val = vmax * i / 2
+        yy  = pyc - int((plot_h / 2) * i / 2)
+        shade = (110, 110, 110) if i == 0 else (70, 70, 70)
+        cv2.line(frame, (px0, yy), (px1, yy), shade, 1)
+        cv2.putText(frame, f"{int(val):+d}" if i else "0", (x0 + 4, yy + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA)
+
+    cv2.putText(frame, f"-{HISTORY_SEC:.0f}s", (px0, py1 + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(frame, "0", (px1 - 8, py1 + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+
+    active_ids = []
+    for tid, hh in heading_history.items():
+        if len(hh) < 2 or t_now - hh[-1][0] > 1.0:
+            continue
+        pts = []
+        for t, yaw in hh:
+            age = t_now - t
+            if age > HISTORY_SEC:
+                continue
+            fx = px1 - int(plot_w * (age / HISTORY_SEC))
+            fy = pyc - int((plot_h / 2) * max(-1.0, min(1.0, yaw / vmax)))
+            pts.append((fx, fy))
+        if len(pts) >= 2:
+            cv2.polylines(frame, [np.array(pts, np.int32)], False,
+                          color_for_id(tid), 2, cv2.LINE_AA)
+            active_ids.append(tid)
+
+    lx = x0 + 90
+    for tid in active_ids[:4]:
+        cv2.rectangle(frame, (lx, y0 + 6), (lx + 10, y0 + 14), color_for_id(tid), -1)
+        cv2.putText(frame, f"id{tid}", (lx + 14, y0 + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (220, 220, 220), 1, cv2.LINE_AA)
+        lx += 50
+
+# ─── Main loop ─────────────────────────────────────────────────
+print(f"Input : {INPUT_VIDEO}  ({total_frames} frames @ {fps:.1f} fps)")
+print(f"Output: {OUTPUT_VIDEO}")
+print(f"Device: {_feat_device}")
+
+_trace_rows = []
+frame_idx = 0
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    t_now = frame_idx / fps
+
+    # ── Detect (RT-DETR-l, no NMS) ──────────────────────────────
+    results = detector(frame, classes=VEHICLE_CLASSES, conf=CONF, iou=IOU,
+                       agnostic_nms=True, verbose=False)
+    boxes   = results[0].boxes
+
+    if boxes is not None and len(boxes):
+        xyxy = boxes.xyxy.cpu().numpy()
+        conf = boxes.conf.cpu().numpy().reshape(-1, 1)
+        cls  = boxes.cls.cpu().numpy().reshape(-1, 1)
+        dets = np.hstack([xyxy, conf, cls]).astype(np.float32)
+        embs = extract_features(frame, xyxy.tolist())
+    else:
+        dets = np.empty((0, 6), dtype=np.float32)
+        embs = np.empty((0, 512), dtype=np.float32)
+
+    # ── Track (Deep OC-SORT + ResNet-18 ReID) ───────────────────
+    tracks = tracker.update(dets, frame, embs)  # (M,8): x1,y1,x2,y2,id,conf,cls,det_ind
+    tracks = nms_tracks(tracks, iou_thresh=0.40)  # autotune best config
+
+    # ── Draw road overlays ───────────────────────────────────────
+    draw_road_overlay(frame, road_poly)
+    cv2.polylines(frame, [src_rect], True, (0, 200, 200), 1)
+
+    # ── Pass 1: collect on-road tracks with ground positions ─────
+    on_road = []  # (tid, x1, y1, x2, y2, gx, gy, x_m, z_m, conf)
+    for row in tracks:
+        x1, y1, x2, y2, tid, conf_, cls_, _ = row
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        tid = int(tid)
+        gx  = (x1 + x2) // 2
+
+        # Reconstruct the tyre-contact y if the box bottom clips the frame.
+        clip_bottom = y2 >= h - EDGE_EPS_PX
+        clip_block  = (x1 <= EDGE_EPS_PX or x2 >= w - EDGE_EPS_PX  # side clipped
+                       or y1 <= EDGE_EPS_PX)                       # top clipped
+        gy, recon_conf = ground_y(tid, t_now, y1, y2, clip_bottom, clip_block)
+
+        # On-road gate.  Test the OBSERVED bottom-centre (clamped to the frame)
+        # against the ROI — the reconstructed gy is off-screen and would always
+        # fail.  A track that has left the ROI is dropped only if it is NOT near
+        # a frame border; if it is near a border and was recently on-road it is
+        # *exiting the scene* (e.g. driving out the bottom), so we keep tracking
+        # and reconstructing it instead of greying it out.
+        gy_obs    = min(int(y2), h - 1)
+        near_edge = (y2 >= h - EXIT_MARGIN_PX or y1 <= EXIT_MARGIN_PX
+                     or x1 <= EXIT_MARGIN_PX or x2 >= w - EXIT_MARGIN_PX)
+        inside    = cv2.pointPolygonTest(road_poly, (float(gx), float(gy_obs)), False) >= 0
+        if inside:
+            on = True
+            was_on_road[tid] = True
+        elif near_edge and was_on_road.get(tid, False):
+            on = True                       # exiting through a frame border
+        else:
+            on = False
+            was_on_road[tid] = False
+        if not on:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (100, 100, 100), 1)
+            continue
+
+        x_m, z_m = project_to_ground(gx, gy)
+        on_road.append((tid, x1, y1, x2, y2, gx, gy, x_m, z_m, recon_conf))
+
+    # ── World-coordinate merge: collapse same-vehicle duplicate IDs ─
+    world_remap = merger.update(
+        t_now, frame_idx,
+        [(tid, x_m, z_m) for tid, _, _, _, _, _, _, x_m, z_m, _ in on_road],
+    )
+
+    # ── Pass 2: draw with canonical IDs ──────────────────────────
+    # Guard: skip duplicate canonical IDs within this frame (both tracks
+    # mapped to the same canonical — only draw once, prefer first occurrence)
+    drawn_cids = set()
+    for tid, x1, y1, x2, y2, gx, gy, x_m, z_m, recon_conf in on_road:
+        cid = world_remap[tid]
+        if cid in drawn_cids:
+            continue
+        drawn_cids.add(cid)
+
+        if cid not in _first_seen:
+            _first_seen[cid] = (frame_idx, t_now)
+        _last_seen[cid] = (frame_idx, t_now)
+
+        color = color_for_id(cid)
+
+        # Reliability of this contact point.  Near the horizon a single pixel of
+        # detection jitter maps to a large world step, spiking BOTH speed and
+        # heading, so we gate both on the same far-road test — expressed as a
+        # ratio to the near-field scale so it is calibration-scale-independent.
+        reliable = (not FAR_GATE_ENABLE) or (local_scale_mpp(gx, gy) <= FAR_GATE_RATIO * MPP_REF)
+
+        # Only update position/speed from a trustworthy contact point.  When the
+        # bottom is clipped beyond the reconstruction horizon (conf == 0) we
+        # coast on the last EMA speed instead of feeding a frozen/garbage point.
+        if recon_conf > 0:
+            history[cid].append((t_now, x_m, z_m))
+            _pos_rows.append((frame_idx, round(t_now, 3), _wall(t_now),
+                              cid, round(x_m, 3), round(z_m, 3)))
+            v = speed_from_history(history[cid], SPEED_WINDOW)   # raw — always logged
+            # Feed the EMA / panel only from reliable (near-road) points so a
+            # far-road jitter spike can't blow up the smoothed speed or the
+            # chart's y-axis.  The raw v above is still written to the trace CSV.
+            if v is not None and reliable:
+                prev_ema       = ema_speed.get(cid, v)
+                ema_speed[cid] = (1 - EMA_ALPHA) * prev_ema + EMA_ALPHA * v
+                speed_history[cid].append((t_now, ema_speed[cid]))
+                _speed_rows.append((frame_idx, round(t_now, 3), _wall(t_now),
+                                    cid, round(ema_speed[cid], 1)))
+            # CTRV heading on the same trustworthy point — held when unreliable.
+            if cid not in ctrv_filt:
+                ctrv_filt[cid] = CTRVFilter(dt=1.0 / fps)
+                ctrv_filt[cid].init(x_m, z_m)
+            if reliable:
+                h_new = ctrv_filt[cid].update(x_m, z_m)
+                # Only expose the heading once the filter has actually seeded a
+                # real direction.  During the onset delay it returns an arbitrary
+                # init (held 0 deg); showing that produces a wrong-way arrow that
+                # then snaps ~180 deg to the true heading once motion is confirmed.
+                if ctrv_filt[cid].has_heading:
+                    heading[cid] = h_new
+                    # Record turn rate (rate of direction change) for the panel,
+                    # only while genuinely moving — a parked car contributes zero.
+                    if ema_speed.get(cid, 0.0) > 5.0:
+                        heading_history[cid].append((t_now, ctrv_filt[cid].yaw_rate_deg))
+        else:
+            v = None
+        hd = heading.get(cid)
+
+        if os.environ.get("DUMP_TRACE"):
+            _cb = int(y2 >= h - EDGE_EPS_PX)
+            _cblk = int(x1 <= EDGE_EPS_PX or x2 >= w - EDGE_EPS_PX or y1 <= EDGE_EPS_PX)
+            _yaw = ctrv_filt[cid].yaw_rate_deg if cid in ctrv_filt else float('nan')
+            _trace_rows.append((frame_idx, round(t_now, 3), cid, round(recon_conf, 2),
+                                round(v, 1) if v is not None else "",
+                                round(ema_speed.get(cid, float('nan')), 1),
+                                y1, y2, gx, round(gy, 1), round(x_m, 2), round(z_m, 2),
+                                _cb, _cblk,
+                                round(hd, 1) if hd is not None else "",
+                                round(_yaw, 1)))
+
+        draw_color = color
+        bbox_thick = 2
+
+        if recon_conf <= 0 or not reliable:
+            spd   = ema_speed.get(cid)
+            label = (f"id{cid}  {spd:.0f}km/h coast" if spd is not None
+                     else f"id{cid}  d={z_m:.1f}m")
+        elif v is not None:
+            label = f"id{cid}  {v:.0f}km/h  d={z_m:.1f}m"
+            if hd is not None:
+                label += f"  {hd:.0f}deg"
+            if recon_conf < 1.0:
+                label += f"  rec{recon_conf:.1f}"
+        else:
+            label = f"id{cid}  d={z_m:.1f}m"
+
+        gy_px = int(round(gy))
+        gp_trace[cid].append((t_now, gx, gy_px))
+        trail = [(px, py) for t, px, py in gp_trace[cid] if t_now - t <= TRACE_SEC]
+        n     = len(trail)
+        if n >= 2:
+            for i in range(1, n):
+                alpha     = i / n
+                seg_color = tuple(int(ch * alpha) for ch in draw_color)
+                cv2.line(frame, trail[i-1], trail[i], seg_color, 2, cv2.LINE_AA)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), draw_color, bbox_thick)
+        cv2.circle(frame, (gx, gy_px), 5, (0, 255, 255), -1)
+
+        spd_kmh = ema_speed.get(cid)
+        if hd is not None and spd_kmh is not None and spd_kmh > 5.0:
+            psi  = np.radians(hd)
+            ahead = ground_to_px(x_m + HEADING_ARROW_M * np.sin(psi),
+                                 z_m + HEADING_ARROW_M * np.cos(psi))
+            cv2.arrowedLine(frame, (gx, gy_px), ahead, (0, 255, 255), 2,
+                            cv2.LINE_AA, tipLength=0.3)
+
+        cv2.putText(frame, label, (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, draw_color, 2, cv2.LINE_AA)
+
+    # ── Prune stale state ────────────────────────────────────────
+    for tid in list(ema_speed):
+        if not history[tid] or t_now - history[tid][-1][0] > 2.0:
+            ema_speed.pop(tid, None)
+    for tid in list(speed_history):
+        if not history[tid] or t_now - history[tid][-1][0] > 2.0:
+            speed_history.pop(tid, None)
+    for tid in list(gp_trace):
+        if not history[tid] or t_now - history[tid][-1][0] > 2.0:
+            gp_trace.pop(tid, None)
+    for tid in list(ctrv_filt):
+        if not history[tid] or t_now - history[tid][-1][0] > 2.0:
+            ctrv_filt.pop(tid, None)
+            heading.pop(tid, None)
+    for tid in list(heading_history):
+        if not history[tid] or t_now - history[tid][-1][0] > 2.0:
+            heading_history.pop(tid, None)
+    for tid in list(box_seen_t):
+        if t_now - box_seen_t[tid] > 2.0:
+            box_seen_t.pop(tid, None)
+            box_hist.pop(tid, None)
+            clip_age.pop(tid, None)
+            was_on_road.pop(tid, None)
+
+    draw_speed_panel(frame, speed_history, ema_speed, t_now, w, h)
+    draw_direction_panel(frame, heading_history, t_now, w, h)
+
+    writer.write(frame)
+    frame_idx += 1
+
+    if frame_idx % 30 == 0:
+        pct = f"{frame_idx/total_frames*100:.1f}%" if total_frames else f"{frame_idx}fr"
+        print(f"\r  {pct}  t={t_now:.1f}s", end="", flush=True)
+
+cap.release()
+writer.release()
+print(f"\nWrote {OUTPUT_VIDEO} ({frame_idx} frames)")
+
+_stem = os.path.splitext(os.path.basename(INPUT_VIDEO))[0]
+
+_session_rows = []
+for cid, (fs_fr, fs_t) in _first_seen.items():
+    ls_fr, ls_t = _last_seen.get(cid, (fs_fr, fs_t))
+    _session_rows.append((cid, fs_fr, round(fs_t, 3), _wall(fs_t),
+                          ls_fr, round(ls_t, 3), _wall(ls_t),
+                          round(ls_t - fs_t, 3)))
+_sess_path = f"out/{_stem}_sessions.csv"
+with open(_sess_path, "w", newline="") as _f:
+    _w = _csv.writer(_f)
+    _w.writerow(["car_id", "enter_frame", "enter_time_s", "enter_time",
+                 "leave_frame", "leave_time_s", "leave_time", "duration_s"])
+    _w.writerows(_session_rows)
+print(f"Wrote {_sess_path} ({len(_session_rows)} vehicles)")
+
+_spd_path = f"out/{_stem}_speed.csv"
+with open(_spd_path, "w", newline="") as _f:
+    _w = _csv.writer(_f)
+    _w.writerow(["frame", "time_s", "wall_time", "car_id", "speed_kmh"])
+    _w.writerows(_speed_rows)
+print(f"Wrote {_spd_path} ({len(_speed_rows)} rows)")
+
+_pos_path = f"out/{_stem}_position.csv"
+with open(_pos_path, "w", newline="") as _f:
+    _w = _csv.writer(_f)
+    _w.writerow(["frame", "time_s", "wall_time", "car_id", "x_m", "z_m"])
+    _w.writerows(_pos_rows)
+print(f"Wrote {_pos_path} ({len(_pos_rows)} rows)")
+
+if os.environ.get("DUMP_TRACE"):
+    with open("out/detect_speed_trace.csv", "w", newline="") as _f:
+        _w = _csv.writer(_f)
+        _w.writerow(["frame", "t", "cid", "recon_conf", "v_kmh", "ema_kmh",
+                     "y1", "y2", "gx", "gy", "x_m", "z_m", "clip_b", "clip_blk",
+                     "heading_deg", "yaw_deg_s"])
+        _w.writerows(_trace_rows)
+    print("Wrote out/detect_speed_trace.csv")
